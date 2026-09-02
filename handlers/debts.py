@@ -1,340 +1,367 @@
-from aiogram import Router, F, types
+"""Adding, listing, and settling debts.
+
+The add flow used to be five separate questions (type, name, amount, currency,
+date). It is now three: type, "who and how much" on one line, and a date -
+with the currency defaulting to whatever the person used last. Fewer steps
+means fewer chances to lose someone halfway.
+"""
+import logging
+
+from aiogram import F, Router, types
 from aiogram.fsm.context import FSMContext
-from states import AddDebt, Registration
-from utils import i18n
-import keyboards as kb
+
 import database as db
-import datetime
+import keyboards as kb
+import views
+from handlers.start import show_home
+from keyboards import CURRENCIES
+from states import AddDebt, Pay
+from utils import fmt_amount, i18n, parse_amount, parse_date, shift_date
 
 router = Router()
+logger = logging.getLogger(__name__)
 
-# Global Back Handler and Settings Handler
-@router.message(F.text.in_([i18n.get("btn_back", "uz"), i18n.get("btn_back", "ru")]))
-async def back_to_main(message: types.Message, state: FSMContext):
+DEFAULT_CURRENCY = CURRENCIES[0]
+
+
+async def _edit(callback: types.CallbackQuery, text, markup=None):
+    """Edit in place, ignoring Telegram's complaint when nothing changed."""
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except Exception as e:  # noqa: BLE001
+        if "not modified" not in str(e).lower():
+            logger.debug("edit_text fell back to send: %s", e)
+            await callback.message.answer(text, reply_markup=markup)
+
+
+async def _last_currency(user_id):
+    debts = await db.get_active_debts(user_id)
+    return debts[0]["currency"] if debts else DEFAULT_CURRENCY
+
+
+# ---------- add ----------
+
+@router.message(F.text.in_(i18n.all_variants("menu_add")))
+async def start_add(message: types.Message, state: FSMContext):
     await state.clear()
-    user = await db.get_user(message.from_user.id)
-    lang = user[2] if user else 'uz'
-    await message.answer(i18n.get("main_menu", lang), reply_markup=kb.get_main_kb(lang))
-
-@router.message(F.text.in_([i18n.get("menu_settings", "uz"), i18n.get("menu_settings", "ru")]))
-async def settings(message: types.Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(Registration.choosing_lang)
-    msg = i18n.get("welcome", "uz") 
-    await message.answer(msg, reply_markup=kb.get_lang_kb())
-
-# --- ADD DEBT FLOW ---
-
-@router.message(F.text.in_([i18n.get("menu_add_debt", "uz"), i18n.get("menu_add_debt", "ru")]))
-async def start_add_debt(message: types.Message, state: FSMContext):
-    await state.clear() 
-    user = await db.get_user(message.from_user.id)
-    lang = user[2]
+    lang = await db.get_user_lang(message.from_user.id)
     await state.update_data(lang=lang)
-    
-    if lang == 'ru':
-        markup = types.ReplyKeyboardMarkup(keyboard=[
-            [types.KeyboardButton(text="Я дал в долг")],
-            [types.KeyboardButton(text="Я взял в долг")],
-            [types.KeyboardButton(text=i18n.get("btn_back", lang))]
-        ], resize_keyboard=True, one_time_keyboard=True)
-        await message.answer("Вы дали деньги или взяли?", reply_markup=markup)
-    else:
-        markup = types.ReplyKeyboardMarkup(keyboard=[
-             [types.KeyboardButton(text="Men qarz berdim")],
-             [types.KeyboardButton(text="Men qarz oldim")],
-             [types.KeyboardButton(text=i18n.get("btn_back", lang))]
-        ], resize_keyboard=True, one_time_keyboard=True)
-        await message.answer("Siz qarz berdingizmi yoki oldingizmi?", reply_markup=markup)
+    await message.answer(i18n.get("add_choose_type", lang), reply_markup=kb.type_kb(lang))
 
-    await state.set_state(AddDebt.choosing_type)
 
-@router.message(AddDebt.choosing_type)
-async def process_type(message: types.Message, state: FSMContext):
-    text = message.text
-    d_type = 'lent'
-    if "oldim" in text.lower() or "взял" in text.lower():
-        d_type = 'borrowed'
-    
-    await state.update_data(debt_type=d_type)
+@router.callback_query(F.data.startswith("type:"))
+async def picked_type(callback: types.CallbackQuery, state: FSMContext):
+    debt_type = callback.data.split(":", 1)[1]
+    lang = await db.get_user_lang(callback.from_user.id)
+    await state.update_data(debt_type=debt_type, lang=lang)
+
+    names = await db.get_recent_names(callback.from_user.id)
+    await state.update_data(recent_names=names)
+    await callback.answer()
+    await _edit(callback, i18n.get("add_who_amount", lang), kb.names_kb(names, lang))
+    await state.set_state(AddDebt.entering_who_amount)
+
+
+@router.callback_query(F.data.startswith("name:"), AddDebt.entering_who_amount)
+async def picked_name(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    lang = data['lang']
-    
-    recent_names = await db.get_recent_names(message.from_user.id)
-    
-    q = i18n.get("debt_who", lang) if d_type == 'lent' else i18n.get("debt_who_borrowed", lang)
-    await message.answer(q, reply_markup=kb.get_names_kb(recent_names, lang))
-    await state.set_state(AddDebt.entering_name)
-
-@router.message(AddDebt.entering_name)
-async def process_name(message: types.Message, state: FSMContext):
-    await state.update_data(person_name=message.text)
-    data = await state.get_data()
-    lang = data['lang']
-    await message.answer(i18n.get("debt_amount", lang), reply_markup=kb.get_back_kb(lang))
+    names = data.get("recent_names", [])
+    try:
+        name = names[int(callback.data.split(":", 1)[1])]
+    except (ValueError, IndexError):
+        await callback.answer(i18n.get("err_not_found", data.get("lang", "uz")), show_alert=True)
+        return
+    await state.update_data(person_name=name)
+    await callback.answer()
+    await _edit(callback, i18n.get("add_ask_amount", data.get("lang", "uz"), name=name))
     await state.set_state(AddDebt.entering_amount)
 
-@router.message(AddDebt.entering_amount)
-async def process_amount(message: types.Message, state: FSMContext):
-    try:
-        # Improved parsing: remove spaces, comma to dot
-        txt = message.text.replace(' ', '').replace(',', '.')
-        amount = float(txt)
-        if amount <= 0: raise ValueError
-    except ValueError:
-        data = await state.get_data()
-        await message.answer(i18n.get("err_invalid_amount", data['lang']))
-        return
 
-    await state.update_data(amount=amount)
+@router.message(AddDebt.entering_who_amount)
+async def got_who_amount(message: types.Message, state: FSMContext):
+    """Accepts 'Ali 500000' or just 'Ali'."""
     data = await state.get_data()
-    await message.answer(i18n.get("debt_currency", data['lang']), reply_markup=kb.get_currency_kb(data['lang']))
-    await state.set_state(AddDebt.choosing_currency)
+    lang = data.get("lang", "uz")
+    parts = (message.text or "").strip().split()
 
-@router.message(AddDebt.choosing_currency)
-async def process_currency(message: types.Message, state: FSMContext):
-    await state.update_data(currency=message.text)
-    data = await state.get_data()
-    await message.answer(i18n.get("debt_date", data['lang']), reply_markup=kb.get_date_options_kb(data['lang']))
-    await state.set_state(AddDebt.entering_date)
-
-@router.message(AddDebt.entering_date)
-async def process_date(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    lang = data['lang']
-    text = message.text
-    final_date_str = ""
-    
-    today = datetime.datetime.now()
-    if text == i18n.get("days_3", lang):
-        delta = datetime.timedelta(days=3)
-        final_date_str = (today + delta).strftime("%d.%m.%Y")
-    elif text == i18n.get("week_1", lang):
-        delta = datetime.timedelta(weeks=1)
-        final_date_str = (today + delta).strftime("%d.%m.%Y")
-    elif text == i18n.get("days_10", lang):
-        delta = datetime.timedelta(days=10)
-        final_date_str = (today + delta).strftime("%d.%m.%Y")
-    elif text == i18n.get("month_1", lang):
-        delta = datetime.timedelta(days=30)
-        final_date_str = (today + delta).strftime("%d.%m.%Y")
-    elif text == i18n.get("btn_end_month", lang):
-        import calendar
-        last_day = calendar.monthrange(today.year, today.month)[1]
-        if today.day < last_day:
-            final_date_str = datetime.date(today.year, today.month, last_day).strftime("%d.%m.%Y")
-        else:
-            # Go to last day of next month
-            year, next_month = today.year, today.month + 1
-            if next_month > 12:
-                year, next_month = year + 1, 1
-            last_day_next = calendar.monthrange(year, next_month)[1]
-            final_date_str = datetime.date(year, next_month, last_day_next).strftime("%d.%m.%Y")
-    elif text == i18n.get("btn_end_week", lang):
-        # Coming Sunday
-        days_ahead = 6 - today.weekday()
-        if days_ahead == 0: days_ahead = 7
-        final_date_str = (today + datetime.timedelta(days=days_ahead)).strftime("%d.%m.%Y")
-    else:
-        # Flexible Date Parsing
-        date_text = text.strip()
-        # Normalize separators
-        for char in ['-', '/', ' ']:
-            date_text = date_text.replace(char, '.')
-        
-        parts = date_text.split('.')
-        try:
-             current_year = datetime.datetime.now().year
-             d, m, y = 0, 0, 0
-             
-             if len(parts) == 2:
-                 # DD.MM -> assume current year
-                 d, m = int(parts[0]), int(parts[1])
-                 y = current_year
-             elif len(parts) == 3:
-                 d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
-                 if y < 100: y += 2000 # 23 -> 2023
-             else:
-                 raise ValueError
-                 
-             # Validate date
-             valid_date = datetime.date(y, m, d)
-             final_date_str = valid_date.strftime("%d.%m.%Y")
-             
-        except ValueError:
-            await message.answer(i18n.get("err_invalid_date", lang))
+    if len(parts) >= 2:
+        amount = parse_amount(" ".join(parts[1:]))
+        if amount:
+            await state.update_data(person_name=parts[0], amount=amount)
+            await _ask_date(message, state, lang)
             return
 
-    await state.update_data(due_date=final_date_str)
-    data = await state.get_data() 
-    
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(i18n.get("add_who_amount", lang))
+        return
+    await state.update_data(person_name=name)
+    await message.answer(i18n.get("add_ask_amount", lang, name=name))
+    await state.set_state(AddDebt.entering_amount)
+
+
+@router.message(AddDebt.entering_amount)
+async def got_amount(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    lang = data.get("lang", "uz")
+    amount = parse_amount(message.text)
+    if not amount:
+        await message.answer(i18n.get("err_amount", lang))
+        return
+    await state.update_data(amount=amount)
+    await _ask_date(message, state, lang)
+
+
+async def _ask_date(message: types.Message, state: FSMContext, lang):
+    await message.answer(
+        i18n.get("add_ask_date", lang) + "\n\n" + i18n.get("date_hint", lang),
+        reply_markup=kb.date_kb(lang),
+    )
+    await state.set_state(AddDebt.entering_date)
+
+
+@router.callback_query(F.data.startswith("date:"), AddDebt.entering_date)
+async def picked_date(callback: types.CallbackQuery, state: FSMContext):
+    choice = callback.data.split(":", 1)[1]
+    iso = {
+        "d3": lambda: shift_date(days=3),
+        "w1": lambda: shift_date(weeks=1),
+        "d10": lambda: shift_date(days=10),
+        "m1": lambda: shift_date(months=1),
+        "ew": lambda: shift_date(end_of="week"),
+        "em": lambda: shift_date(end_of="month"),
+    }.get(choice, lambda: shift_date(days=7))()
+    await callback.answer()
+    await _show_confirm(callback.message, state, iso, edit_from=callback)
+
+
+@router.message(AddDebt.entering_date)
+async def typed_date(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    lang = data.get("lang", "uz")
+    iso = parse_date(message.text)
+    if not iso:
+        await message.answer(i18n.get("err_date", lang))
+        return
+    await _show_confirm(message, state, iso)
+
+
+async def _show_confirm(message, state: FSMContext, iso_date, edit_from=None):
+    data = await state.get_data()
+    lang = data.get("lang", "uz")
+    currency = data.get("currency") or await _last_currency(
+        (edit_from or message).from_user.id if edit_from else message.chat.id
+    )
+    await state.update_data(due_date=iso_date, currency=currency)
+
+    payload = {
+        "person_name": data.get("person_name", "?"),
+        "amount": data.get("amount", 0),
+        "currency": currency,
+        "due_date": iso_date,
+        "debt_type": data.get("debt_type", "lent"),
+    }
+    text = views.confirm_card(payload, lang)
+    if edit_from:
+        await _edit(edit_from, text, kb.confirm_kb(lang))
+    else:
+        await message.answer(text, reply_markup=kb.confirm_kb(lang))
+
+
+@router.callback_query(F.data == "pick_cur")
+async def pick_currency(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await callback.answer()
+    await _edit(callback, i18n.get("choose_currency", data.get("lang", "uz")),
+                kb.currency_kb(data.get("lang", "uz")))
+
+
+@router.callback_query(F.data.startswith("cur:"))
+async def picked_currency(callback: types.CallbackQuery, state: FSMContext):
     try:
-        await db.add_debt(
-            user_id=message.from_user.id,
-            debt_type=data['debt_type'],
-            amount=data['amount'],
-            currency=data['currency'],
-            person_name=data['person_name'],
-            due_date=final_date_str,
-            description="" 
-        )
-    except Exception as e:
-        await message.answer(f"Error saving debt: {e}")
-        return
-    
-    await message.answer(i18n.get("debt_saved", lang), reply_markup=kb.get_main_kb(lang))
-    await state.clear()
-
-# --- LIST DEBTS ---
-
-async def send_debt_list(message: types.Message, user_id: int, debt_type: str):
-    user = await db.get_user(user_id)
-    lang = user[2]
-    debts = await db.get_active_debts(user_id, debt_type)
-    
-    if not debts:
-        await message.answer(i18n.get("debt_list_empty", lang))
-        return
-
-    header_key = "owe_me_header" if debt_type == 'lent' else "i_owe_header"
-    await message.answer(i18n.get(header_key, lang), parse_mode="HTML")
-    
-    totals = {}
-    from utils import format_amount
-
-    for d in debts:
-        # Card View
-        paid_amount = d['paid_amount'] or 0
-        total_amount = d['amount']
-        remaining = total_amount - paid_amount
-        
-        # Calculate totals
-        curr = d['currency']
-        totals[curr] = totals.get(curr, 0) + remaining
-
-        if paid_amount > 0:
-            # Bug fix: use remaining for the main amount, format both.
-            txt = i18n.get("debt_item_partial", lang, 
-                        total=format_amount(total_amount), 
-                        remaining=format_amount(remaining),
-                        paid=format_amount(paid_amount),
-                        name=d['person_name'], 
-                        currency=d['currency'], 
-                        date=d['due_date'])
-        else:
-            txt = i18n.get("debt_item", lang, 
-                        name=d['person_name'], 
-                        amount=format_amount(total_amount), 
-                        currency=d['currency'], 
-                        date=d['due_date'])
-        
-        # Buttons: Partial | Full Close
-        btn_close_full = i18n.get("btn_close_full", lang)
-        if btn_close_full == "btn_close_full": 
-            btn_close_full = "✅ Yopish" if lang=='uz' else "✅ Закрыть"
-
-        btn_partial = i18n.get("partial_pay_btn", lang)
-
-        markup = types.InlineKeyboardMarkup(inline_keyboard=[
-            [
-                types.InlineKeyboardButton(text=btn_partial, callback_data=f"paypart_{d['id']}"),
-                types.InlineKeyboardButton(text=btn_close_full, callback_data=f"payfull_{d['id']}")
-            ]
-        ])
-        
-        await message.answer(txt, reply_markup=markup, parse_mode="HTML")
-
-    # Send Totals Summary
-    if totals:
-        total_strings = []
-        for curr, val in totals.items():
-            total_strings.append(f"<b>{format_amount(val)} {curr}</b>")
-        
-        div = " и " if lang == 'ru' else " va "
-        totals_text = div.join(total_strings)
-        summary = i18n.get("total_summary", lang, totals=totals_text)
-        await message.answer(summary, parse_mode="HTML")
-
-@router.message(F.text.in_([i18n.get("menu_owe_me", "uz"), i18n.get("menu_owe_me", "ru")]))
-async def show_owe_me(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_debt_list(message, message.from_user.id, 'lent')
-
-@router.message(F.text.in_([i18n.get("menu_i_owe", "uz"), i18n.get("menu_i_owe", "ru")]))
-async def show_i_owe(message: types.Message, state: FSMContext):
-    await state.clear()
-    await send_debt_list(message, message.from_user.id, 'borrowed')
-
-# --- CALLBACK HANDLER ---
-
-@router.callback_query(F.data.startswith("payfull_"))
-async def process_pay_full_callback(callback: types.CallbackQuery):
-    debt_id = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-    
-    await db.mark_debt_paid(debt_id, user_id)
-    
-    user = await db.get_user(user_id)
-    lang = user[2] if user else 'uz'
-    
-    await callback.answer(i18n.get("debt_closed", lang))
-    await callback.message.delete()
-
-@router.callback_query(F.data.startswith("paypart_"))
-async def process_pay_partial_callback(callback: types.CallbackQuery, state: FSMContext):
-    debt_id = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-    
-    # Save debt_id to state
-    await state.set_state(AddDebt.paying_amount)
-    await state.update_data(paying_debt_id=debt_id)
-    
-    user = await db.get_user(user_id)
-    lang = user[2] if user else 'uz'
-    await state.update_data(lang=lang)
-    
-    await callback.message.answer(i18n.get("enter_payment_amount", lang), reply_markup=kb.get_back_kb(lang))
+        currency = CURRENCIES[int(callback.data.split(":", 1)[1])]
+    except (ValueError, IndexError):
+        currency = DEFAULT_CURRENCY
+    data = await state.get_data()
+    await state.update_data(currency=currency)
     await callback.answer()
 
-@router.message(AddDebt.paying_amount)
-async def process_payment_amount(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    lang = data['lang']
-    debt_id = data['paying_debt_id']
-    
-    try:
-        txt = message.text.replace(' ', '').replace(',', '.')
-        amount = float(txt)
-        if amount <= 0: raise ValueError
-    except ValueError:
-        await message.answer(i18n.get("err_invalid_amount", lang))
-        return
+    payload = {
+        "person_name": data.get("person_name", "?"),
+        "amount": data.get("amount", 0),
+        "currency": currency,
+        "due_date": data.get("due_date"),
+        "debt_type": data.get("debt_type", "lent"),
+    }
+    await _edit(callback, views.confirm_card(payload, data.get("lang", "uz")),
+                kb.confirm_kb(data.get("lang", "uz")))
 
-    # Process Payment
-    user_id = message.from_user.id
-    
-    # Check bounds
-    debt = await db.get_debt(debt_id)
-    if not debt:
-        await message.answer("Error: Debt not found.")
+
+@router.callback_query(F.data == "save")
+async def save_debt(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    lang = data.get("lang", "uz")
+    required = ("debt_type", "person_name", "amount", "due_date")
+    if not all(data.get(k) for k in required):
+        await callback.answer(i18n.get("err_generic", lang), show_alert=True)
         await state.clear()
         return
 
-    current_paid = debt['paid_amount'] if debt['paid_amount'] else 0
-    total = debt['amount']
-    remaining = total - current_paid
-    
-    if amount > remaining:
-         await message.answer(i18n.get("err_payment_too_large", lang, remaining=f"{remaining:g}", currency=debt['currency']))
-         return
-         
-    success = await db.update_debt_payment(debt_id, user_id, amount)
-    
-    if success:
-        new_remaining = remaining - amount
-        if new_remaining <= 0:
-            await message.answer(i18n.get("payment_full_success", lang), reply_markup=kb.get_main_kb(lang))
-        else:
-            await message.answer(i18n.get("payment_success", lang, remaining=f"{new_remaining:g}", currency=debt['currency']), reply_markup=kb.get_main_kb(lang))
-            
+    await db.add_debt(
+        user_id=callback.from_user.id,
+        debt_type=data["debt_type"],
+        amount=data["amount"],
+        currency=data.get("currency") or DEFAULT_CURRENCY,
+        person_name=data["person_name"],
+        due_date=data["due_date"],
+    )
     await state.clear()
+    await callback.answer()
+    await _edit(callback, i18n.get("confirm_saved", lang))
+    await show_home(callback.message, callback.from_user.id, lang)
+
+
+# ---------- lists ----------
+
+async def _send_list(message, user_id, debt_type, lang, edit_from=None):
+    debts = await db.get_active_debts(user_id, debt_type)
+    text = views.debt_list_card(debts, debt_type, lang)
+    markup = kb.debt_numbers_kb(debts, debt_type) if debts else None
+    if edit_from:
+        await _edit(edit_from, text, markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+@router.message(F.text.in_(i18n.all_variants("menu_owe_me")))
+async def list_owe_me(message: types.Message, state: FSMContext):
+    await state.clear()
+    lang = await db.get_user_lang(message.from_user.id)
+    await _send_list(message, message.from_user.id, "lent", lang)
+
+
+@router.message(F.text.in_(i18n.all_variants("menu_i_owe")))
+async def list_i_owe(message: types.Message, state: FSMContext):
+    await state.clear()
+    lang = await db.get_user_lang(message.from_user.id)
+    await _send_list(message, message.from_user.id, "borrowed", lang)
+
+
+@router.callback_query(F.data.startswith("list:"))
+async def back_to_list(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    debt_type = callback.data.split(":", 1)[1]
+    lang = await db.get_user_lang(callback.from_user.id)
+    await callback.answer()
+    await _send_list(None, callback.from_user.id, debt_type, lang, edit_from=callback)
+
+
+# ---------- one debt ----------
+
+@router.callback_query(F.data.startswith("debt:"))
+async def open_debt(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, debt_id, back_to = callback.data.split(":")
+    lang = await db.get_user_lang(callback.from_user.id)
+    debt = await db.get_debt(int(debt_id))
+    if not debt or debt["user_id"] != callback.from_user.id:
+        await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
+        return
+    await callback.answer()
+    await _edit(callback, views.debt_card(debt, lang),
+                kb.debt_card_kb(debt["id"], lang, back_to))
+
+
+@router.callback_query(F.data.startswith("close:"))
+async def close_debt(callback: types.CallbackQuery):
+    debt_id = int(callback.data.split(":", 1)[1])
+    lang = await db.get_user_lang(callback.from_user.id)
+    ok = await db.mark_debt_paid(debt_id, callback.from_user.id)
+    await callback.answer(i18n.get("debt_closed" if ok else "err_not_found", lang))
+    if ok:
+        debt = await db.get_debt(debt_id)
+        await _send_list(None, callback.from_user.id, debt["debt_type"], lang, edit_from=callback)
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def ask_delete(callback: types.CallbackQuery):
+    debt_id = int(callback.data.split(":", 1)[1])
+    lang = await db.get_user_lang(callback.from_user.id)
+    debt = await db.get_debt(debt_id)
+    if not debt or debt["user_id"] != callback.from_user.id:
+        await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
+        return
+    await callback.answer()
+    await _edit(callback, i18n.get("confirm_delete", lang),
+                kb.confirm_delete_kb(debt_id, lang, debt["debt_type"]))
+
+
+@router.callback_query(F.data.startswith("delyes:"))
+async def do_delete(callback: types.CallbackQuery):
+    debt_id = int(callback.data.split(":", 1)[1])
+    lang = await db.get_user_lang(callback.from_user.id)
+    debt = await db.get_debt(debt_id)
+    debt_type = debt["debt_type"] if debt else "lent"
+    await db.delete_debt(debt_id, callback.from_user.id)
+    await callback.answer(i18n.get("debt_deleted", lang))
+    await _send_list(None, callback.from_user.id, debt_type, lang, edit_from=callback)
+
+
+# ---------- payments ----------
+
+@router.callback_query(F.data.startswith("pay:"))
+async def ask_payment(callback: types.CallbackQuery, state: FSMContext):
+    debt_id = int(callback.data.split(":", 1)[1])
+    lang = await db.get_user_lang(callback.from_user.id)
+    debt = await db.get_debt(debt_id)
+    if not debt or debt["user_id"] != callback.from_user.id:
+        await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
+        return
+
+    remaining = (debt["amount"] or 0) - (debt["paid_amount"] or 0)
+    await state.set_state(Pay.entering_amount)
+    await state.update_data(debt_id=debt_id, lang=lang)
+    await callback.answer()
+    await callback.message.answer(i18n.get(
+        "ask_payment", lang,
+        name=debt["person_name"],
+        remaining=fmt_amount(remaining),
+        currency=debt["currency"],
+    ))
+
+
+@router.message(Pay.entering_amount)
+async def got_payment(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    lang = data.get("lang", "uz")
+    amount = parse_amount(message.text)
+    if not amount:
+        await message.answer(i18n.get("err_amount", lang))
+        return
+
+    debt = await db.get_debt(data["debt_id"])
+    if not debt or debt["user_id"] != message.from_user.id:
+        await message.answer(i18n.get("err_not_found", lang))
+        await state.clear()
+        return
+
+    remaining = (debt["amount"] or 0) - (debt["paid_amount"] or 0)
+    if amount > remaining + 0.001:
+        await message.answer(i18n.get("err_too_large", lang,
+                                      remaining=fmt_amount(remaining),
+                                      currency=debt["currency"]))
+        return
+
+    ok, left = await db.update_debt_payment(data["debt_id"], message.from_user.id, amount)
+    await state.clear()
+    if not ok:
+        await message.answer(i18n.get("err_not_found", lang))
+        return
+
+    if left <= 0:
+        await message.answer(i18n.get("payment_full", lang))
+    else:
+        await message.answer(i18n.get("payment_partial", lang,
+                                      remaining=fmt_amount(left),
+                                      currency=debt["currency"]))
+    await show_home(message, message.from_user.id, lang)

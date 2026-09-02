@@ -1,17 +1,22 @@
 from aiogram.fsm.state import State, StatesGroup
 
+
 class Registration(StatesGroup):
-    choosing_lang = State()
     sending_phone = State()
 
-class AddDebt(StatesGroup):
-    choosing_type = State() # Lent or Borrowed
-    entering_name = State()
-    entering_amount = State()
-    choosing_currency = State()
-    entering_date = State()
-    entering_desc = State()
-    paying_amount = State() # For partial payments
 
-class AdminStates(StatesGroup):
-    waiting_for_broadcast_msg = State()
+class AddDebt(StatesGroup):
+    # "Ali 500000" in one message covers name+amount for most people; the
+    # amount-only step is the fallback when the name came from a button or
+    # the single line couldn't be split confidently.
+    entering_who_amount = State()
+    entering_amount = State()
+    entering_date = State()
+
+
+class Pay(StatesGroup):
+    entering_amount = State()
+
+
+class Admin(StatesGroup):
+    broadcast = State()

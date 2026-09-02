@@ -1,48 +1,67 @@
-from aiogram import Router, F, types, Bot
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from states import AdminStates
-import database as db
-import os
+"""Admin-only commands: stats and broadcast."""
 import asyncio
 import logging
 
-router = Router()
-@router.message(Command("sendall"))
-async def admin_broadcast_start(message: types.Message, state: FSMContext):
-    admin_id = os.getenv("ADMIN_ID")
-    if str(message.from_user.id) != str(admin_id):
-        # Silently ignore or give feedback for debugging
-        # await message.answer(f"Access denied. Your ID: {message.from_user.id}")
-        return
-    
-    await message.answer("Введите текст сообщения для рассылки всем пользователям:")
-    await state.set_state(AdminStates.waiting_for_broadcast_msg)
+from aiogram import Bot, F, Router, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 
-@router.message(AdminStates.waiting_for_broadcast_msg)
-async def process_broadcast(message: types.Message, state: FSMContext, bot: Bot):
-    admin_id = os.getenv("ADMIN_ID")
-    if str(message.from_user.id) != str(admin_id):
+import database as db
+from config import ADMIN_ID
+from states import Admin
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+def _is_admin(user_id: int) -> bool:
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if not _is_admin(message.from_user.id):
+        return
+    stats = await db.get_stats()
+    await message.answer(
+        "📊 <b>Statistika</b>\n"
+        + "━" * 18 + "\n"
+        f"<code>Foydalanuvchilar: {stats['users']}</code>\n"
+        f"<code>Faol qarzlar:     {stats['debts_active']}</code>\n"
+        f"<code>Yopilgan:         {stats['debts_paid']}</code>"
+    )
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        return
+    await state.set_state(Admin.broadcast)
+    await message.answer("Yuboriladigan xabarni yozing.\nBekor qilish: /cancel")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.")
+
+
+@router.message(Admin.broadcast)
+async def do_broadcast(message: types.Message, state: FSMContext, bot: Bot):
+    if not _is_admin(message.from_user.id):
         await state.clear()
         return
-
-    broadcast_text = message.text
     await state.clear()
-    
-    users = await db.get_all_users()
-    count = 0
-    errors = 0
-    
-    status_msg = await message.answer(f"Начинаю рассылку для {len(users)} пользователей...")
-    
-    for user_id in users:
+
+    user_ids = await db.get_all_user_ids()
+    sent = 0
+    for uid in user_ids:
         try:
-            await bot.send_message(user_id, broadcast_text)
-            count += 1
-            # Sleep slightly to avoid flood limits
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            logging.error(f"Failed to send broadcast to {user_id}: {e}")
-            errors += 1
-            
-    await status_msg.edit_text(f"Рассылка завершена!\n✅ Успешно: {count}\n❌ Ошибок: {errors}")
+            await bot.send_message(uid, message.html_text)
+            sent += 1
+        except Exception as e:  # noqa: BLE001 - one blocked chat must not stop the rest
+            logger.info("Broadcast skipped %s: %s", uid, e)
+        # Telegram throttles bulk sends; ~20/sec is the safe ceiling.
+        await asyncio.sleep(0.05)
+
+    await message.answer(f"✅ {sent}/{len(user_ids)} ta foydalanuvchiga yuborildi.")

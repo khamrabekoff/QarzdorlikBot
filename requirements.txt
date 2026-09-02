@@ -1,6 +1,4 @@
-aiogram
-aiosqlite
-apscheduler
-python-dotenv
-aiohttp_socks
-flask
+aiogram>=3.7
+aiosqlite>=0.19
+python-dotenv>=1.0
+flask>=3.0

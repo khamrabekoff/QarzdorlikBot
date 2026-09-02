@@ -1,43 +1,28 @@
+#!/usr/bin/env python3
+"""Point Telegram at this deployment's webhook. Run once after deploying."""
 import asyncio
-import os
+import logging
+
 from aiogram import Bot
-from dotenv import load_dotenv
+from aiogram.client.session.aiohttp import AiohttpSession
 
-load_dotenv()
+from config import BOT_TOKEN, PROXY_URL, WEBHOOK_URL
 
-TOKEN = os.getenv("BOT_TOKEN")
-# Replace 'username' with your actual PythonAnywhere username
-USERNAME = "your_username" 
-WEBHOOK_URL = f"https://{USERNAME}.pythonanywhere.com/webhook"
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
 
 async def main():
-    # PythonAnywhere Proxy Check
-    session = None
-    if os.getenv("PYTHONANYWHERE_DOMAIN"):
-        from aiogram.client.session.aiohttp import AiohttpSession
-        session = AiohttpSession(proxy="http://proxy.server:3128")
-        print("Using PythonAnywhere proxy...")
+    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+    bot = Bot(token=BOT_TOKEN, session=session)
+    try:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        info = await bot.get_webhook_info()
+        logging.info("Webhook set to %s", info.url)
+        logging.info("Pending: %s | Last error: %s",
+                     info.pending_update_count, info.last_error_message or "none")
+    finally:
+        await bot.session.close()
 
-    bot = Bot(token=TOKEN, session=session)
-    print(f"Setting webhook to: {WEBHOOK_URL}...")
-    
-    success = await bot.set_webhook(WEBHOOK_URL)
-    
-    if success:
-        print("✅ Webhook successfully set!")
-        print(f"Your bot is now listening at {WEBHOOK_URL}")
-    else:
-        print("❌ Failed to set webhook.")
-    
-    await bot.session.close()
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        USERNAME = sys.argv[1]
-        WEBHOOK_URL = f"https://{USERNAME}.pythonanywhere.com/webhook"
-    else:
-        print("Usage: python set_webhook.py YOUR_PYTHONANYWHERE_USERNAME")
-        sys.exit(1)
-        
     asyncio.run(main())
