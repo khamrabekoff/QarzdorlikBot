@@ -23,12 +23,24 @@ async def cmd_stats(message: types.Message):
     if not _is_admin(message.from_user.id):
         return
     stats = await db.get_stats()
+    g = await db.get_growth_stats()
+
+    def pct(part, whole):
+        return f"{round(100 * part / whole)}%" if whole else "-"
+
     await message.answer(
-        "📊 <b>Statistika</b>\n"
-        + "━" * 18 + "\n"
+        "📊 <b>Statistika</b>\n" + "━" * 18 + "\n"
         f"<code>Foydalanuvchilar: {stats['users']}</code>\n"
         f"<code>Faol qarzlar:     {stats['debts_active']}</code>\n"
-        f"<code>Yopilgan:         {stats['debts_paid']}</code>"
+        f"<code>Yopilgan:         {stats['debts_paid']}</code>\n\n"
+        "📈 <b>O'sish (7 kun)</b>\n" + "━" * 18 + "\n"
+        f"<code>Yangi:            {g['users_week']}</code>\n"
+        f"<code>Faol:             {g['active_week']} ({pct(g['active_week'], g['users_total'])})</code>\n"
+        f"<code>Yangi qarzlar:    {g['debts_week']}</code>\n\n"
+        "🤝 <b>Ulashish</b>\n" + "━" * 18 + "\n"
+        f"<code>Yuborilgan:       {g['shares_sent']}</code>\n"
+        f"<code>Tasdiqlangan:     {g['shares_accepted']} ({pct(g['shares_accepted'], g['shares_sent'])})</code>\n"
+        f"<code>Taklif orqali:    {g['from_referral']}</code>"
     )
 
 

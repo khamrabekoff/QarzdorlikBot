@@ -117,17 +117,35 @@ def debt_numbers_kb(debts, back_to):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def debt_card_kb(debt_id, lang, back_to):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
+def debt_card_kb(debt_id, lang, back_to, is_mine=True, shareable=False):
+    """Only the owner gets editing buttons; the other party sees it read-only.
+    Keeping edits one-sided avoids two people silently overwriting each other."""
+    rows = []
+    if is_mine:
+        rows.append([
             InlineKeyboardButton(text=i18n.get("btn_pay", lang), callback_data=f"pay:{debt_id}"),
             InlineKeyboardButton(text=i18n.get("btn_close", lang), callback_data=f"close:{debt_id}"),
-        ],
-        [
+        ])
+        if shareable:
+            rows.append([
+                InlineKeyboardButton(text=i18n.get("btn_share", lang), callback_data=f"share:{debt_id}")
+            ])
+        rows.append([
             InlineKeyboardButton(text=i18n.get("btn_delete", lang), callback_data=f"del:{debt_id}"),
             InlineKeyboardButton(text=i18n.get("btn_back", lang), callback_data=f"list:{back_to}"),
-        ],
-    ])
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text=i18n.get("btn_back", lang), callback_data=f"list:{back_to}")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def share_confirm_kb(token, lang):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=i18n.get("btn_confirm_share", lang), callback_data=f"shyes:{token}"),
+        InlineKeyboardButton(text=i18n.get("btn_decline_share", lang), callback_data=f"shno:{token}"),
+    ]])
 
 
 def confirm_delete_kb(debt_id, lang, back_to):
@@ -141,4 +159,5 @@ def settings_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=i18n.get("btn_change_lang", lang), callback_data="pick_lang")],
         [InlineKeyboardButton(text=i18n.get("btn_history", lang), callback_data="history")],
+        [InlineKeyboardButton(text=i18n.get("btn_invite", lang), callback_data="invite")],
     ])

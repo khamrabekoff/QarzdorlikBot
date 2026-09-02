@@ -69,11 +69,16 @@ def debt_list_card(debts, debt_type, lang):
 
         overdue = (days_until(d["due_date"]) or 0) < 0
         marker = "⚠️" if overdue else "▫️"
+        if _has(d, "share_status") and d["share_status"] == "accepted":
+            marker = "🤝"  # confirmed by both sides
         when = due_phrase(d["due_date"], lang)
         if d["due_date"]:
             when = f"{fmt_date(d['due_date'])} — {when}"
+        who = d["person_name"]
+        if _has(d, "is_mine") and not d["is_mine"]:
+            who = ("@" + d["owner_username"]) if _has(d, "owner_username") and d["owner_username"] else "?"
         text += (
-            f"{marker} <b>{idx}. {d['person_name']}</b>\n"
+            f"{marker} <b>{idx}. {who}</b>\n"
             f"     {fmt_amount(remaining)} {d['currency']}\n"
             f"     <i>{when}</i>\n"
         )
@@ -87,12 +92,41 @@ def debt_list_card(debts, debt_type, lang):
     return text
 
 
-def debt_card(debt, lang):
+def _has(row, field):
+    """Rows from the shared-view query carry extra columns; plain lookups don't."""
+    try:
+        return field in row.keys()
+    except AttributeError:
+        return field in row
+
+
+def debt_card(debt, lang, owner_name=None):
     remaining = (debt["amount"] or 0) - (debt["paid_amount"] or 0)
-    direction = i18n.get("dir_lent" if debt["debt_type"] == "lent" else "dir_borrowed", lang)
+    # For a shared debt the reader may be the counterparty, for whom the
+    # direction is reversed; view_type carries that already-flipped value.
+    dtype = debt["view_type"] if _has(debt, "view_type") else debt["debt_type"]
+    is_mine = debt["is_mine"] if _has(debt, "is_mine") else 1
+    direction = i18n.get("dir_lent" if dtype == "lent" else "dir_borrowed", lang)
+
+    badge = ""
+    if _has(debt, "share_status"):
+        if debt["share_status"] == "accepted":
+            badge = "  " + i18n.get("shared_badge", lang)
+        elif debt["share_status"] == "pending":
+            badge = "  " + i18n.get("share_pending", lang)
+
+    # The owner wrote the OTHER party's name into person_name. Showing that
+    # back to the other party reads as "Ali — you owe", which is nonsense from
+    # their side: they need to see who recorded the debt.
+    title = debt["person_name"]
+    if not is_mine:
+        title = owner_name or (
+            "@" + debt["owner_username"]
+            if _has(debt, "owner_username") and debt["owner_username"] else "?"
+        )
 
     text = (
-        f"👤 <b>{debt['person_name']}</b>\n"
+        f"👤 <b>{title}</b>{badge}\n"
         f"<i>{direction}</i>\n"
         + "━" * 18 + "\n\n"
         f"💵 {fmt_amount(debt['amount'])} {debt['currency']}\n"
@@ -105,6 +139,8 @@ def debt_card(debt, lang):
         text += i18n.get("card_remaining", lang,
                          remaining=fmt_amount(remaining),
                          currency=debt["currency"])
+    if not is_mine and owner_name:
+        text += "\n\n" + i18n.get("readonly_hint", lang, owner=owner_name)
     return text
 
 

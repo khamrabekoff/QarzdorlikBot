@@ -53,6 +53,15 @@ async def init_db():
         for stmt in (
             "ALTER TABLE debts ADD COLUMN last_reminded_at TIMESTAMP",
             "ALTER TABLE debts ADD COLUMN paid_amount REAL DEFAULT 0",
+            # Sharing: a debt can be linked to the other party, who then sees
+            # it mirrored (their 'I owe' is the owner's 'owed to me').
+            "ALTER TABLE debts ADD COLUMN counterparty_id INTEGER",
+            "ALTER TABLE debts ADD COLUMN share_token TEXT",
+            "ALTER TABLE debts ADD COLUMN share_status TEXT",
+            # Growth tracking: where each user came from.
+            "ALTER TABLE users ADD COLUMN referred_by INTEGER",
+            "ALTER TABLE users ADD COLUMN source TEXT",
+            "ALTER TABLE users ADD COLUMN last_active TIMESTAMP",
         ):
             try:
                 await db.execute(stmt)
@@ -62,6 +71,8 @@ async def init_db():
         # Without these, every list and every reminder sweep is a full scan.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_debts_user_status ON debts(user_id, status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_debts_status_due ON debts(status, due_date)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_debts_counterparty ON debts(counterparty_id, status)")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_debts_share_token ON debts(share_token)")
 
         await db.commit()
 
@@ -148,16 +159,34 @@ async def add_debt(user_id: int, debt_type: str, amount: float, currency: str,
         return cur.lastrowid
 
 
+# A shared debt is one row seen from both sides: the owner's "they owe me" is
+# the counterparty's "I owe". `view_type` is that flipped direction, and
+# `is_mine` says whether this user owns the row (only owners may edit it).
+_VIEW_SELECT = """
+    SELECT d.*,
+           CASE WHEN d.user_id = :uid THEN d.debt_type
+                WHEN d.debt_type = 'lent' THEN 'borrowed'
+                ELSE 'lent' END                        AS view_type,
+           CASE WHEN d.user_id = :uid THEN 1 ELSE 0 END AS is_mine,
+           u.username                                   AS owner_username
+    FROM debts d
+    LEFT JOIN users u ON u.id = d.user_id
+    WHERE d.status = 'active'
+      AND (d.user_id = :uid
+           OR (d.counterparty_id = :uid AND d.share_status = 'accepted'))
+"""
+
+
 async def get_active_debts(user_id: int, debt_type: Optional[str] = None):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        query = "SELECT * FROM debts WHERE user_id = ? AND status = 'active'"
-        params = [user_id]
+        query = _VIEW_SELECT
+        params = {"uid": user_id}
         if debt_type:
-            query += " AND debt_type = ?"
-            params.append(debt_type)
+            query += " AND (CASE WHEN d.user_id = :uid THEN d.debt_type WHEN d.debt_type = 'lent' THEN 'borrowed' ELSE 'lent' END) = :dtype"
+            params["dtype"] = debt_type
         # NULLs (open-ended debts) sort last, not first as SQLite would default to.
-        query += " ORDER BY due_date IS NULL, due_date ASC, id ASC"
+        query += " ORDER BY d.due_date IS NULL, d.due_date ASC, d.id ASC"
         async with db.execute(query, params) as cur:
             return await cur.fetchall()
 
@@ -269,13 +298,18 @@ async def get_totals(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT debt_type, currency,
-                   SUM(amount - COALESCE(paid_amount, 0)) AS remaining,
+            SELECT CASE WHEN d.user_id = :uid THEN d.debt_type
+                        WHEN d.debt_type = 'lent' THEN 'borrowed'
+                        ELSE 'lent' END AS debt_type,
+                   d.currency,
+                   SUM(d.amount - COALESCE(d.paid_amount, 0)) AS remaining,
                    COUNT(*) AS n
-            FROM debts
-            WHERE user_id = ? AND status = 'active'
-            GROUP BY debt_type, currency
-        """, (user_id,)) as cur:
+            FROM debts d
+            WHERE d.status = 'active'
+              AND (d.user_id = :uid
+                   OR (d.counterparty_id = :uid AND d.share_status = 'accepted'))
+            GROUP BY debt_type, d.currency
+        """, {"uid": user_id}) as cur:
             return await cur.fetchall()
 
 
@@ -300,3 +334,111 @@ async def backup_to(dest_path: str):
         async with aiosqlite.connect(dest_path) as dst:
             await src.backup(dst)
     return dest_path
+
+
+# ---------- sharing ----------
+
+async def create_share_token(debt_id: int, owner_id: int):
+    """Mint (or reuse) the token behind a debt's invite link."""
+    import secrets
+    debt = await get_debt(debt_id)
+    if not debt or debt["user_id"] != owner_id:
+        return None
+    if debt["share_token"]:
+        return debt["share_token"]
+    token = secrets.token_urlsafe(8)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE debts SET share_token = ?, share_status = 'pending' WHERE id = ?",
+            (token, debt_id),
+        )
+        await db.commit()
+    return token
+
+
+async def get_debt_by_token(token: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM debts WHERE share_token = ?", (token,)) as cur:
+            return await cur.fetchone()
+
+
+async def accept_share(token: str, counterparty_id: int):
+    """Link the other party to the debt. Returns (ok, reason)."""
+    debt = await get_debt_by_token(token)
+    if not debt:
+        return False, "not_found"
+    if debt["user_id"] == counterparty_id:
+        return False, "own_debt"  # can't confirm a debt against yourself
+    if debt["counterparty_id"] and debt["counterparty_id"] != counterparty_id:
+        return False, "taken"     # someone already claimed this link
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE debts SET counterparty_id = ?, share_status = 'accepted' WHERE id = ?",
+            (counterparty_id, debt["id"]),
+        )
+        await db.commit()
+    return True, debt
+
+
+async def decline_share(token: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE debts SET share_status = 'declined' WHERE share_token = ?", (token,)
+        )
+        await db.commit()
+
+
+# ---------- growth ----------
+
+async def record_referral(user_id: int, referrer_id: Optional[int], source: str):
+    """Only ever set once - the first touch is the one that brought them in."""
+    if referrer_id == user_id:
+        referrer_id = None
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """UPDATE users SET referred_by = COALESCE(referred_by, ?),
+                                source      = COALESCE(source, ?)
+               WHERE id = ?""",
+            (referrer_id, source, user_id),
+        )
+        await db.commit()
+
+
+async def touch_user(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?", (user_id,)
+        )
+        await db.commit()
+
+
+async def count_referrals(user_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+
+async def get_growth_stats():
+    """Numbers that answer 'is this thing growing, and where from?'"""
+    queries = {
+        "users_total": "SELECT COUNT(*) FROM users",
+        "users_week": "SELECT COUNT(*) FROM users WHERE joined_at >= DATE('now', '-7 days')",
+        "active_week": "SELECT COUNT(*) FROM users WHERE last_active >= DATE('now', '-7 days')",
+        "from_referral": "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL",
+        "debts_week": "SELECT COUNT(*) FROM debts WHERE created_at >= DATE('now', '-7 days')",
+        "shares_sent": "SELECT COUNT(*) FROM debts WHERE share_token IS NOT NULL",
+        "shares_accepted": "SELECT COUNT(*) FROM debts WHERE share_status = 'accepted'",
+    }
+    out = {}
+    async with aiosqlite.connect(DB_NAME) as db:
+        for name, sql in queries.items():
+            try:
+                async with db.execute(sql) as cur:
+                    out[name] = (await cur.fetchone())[0]
+            except Exception as e:
+                logger.warning("growth stat %s failed: %s", name, e)
+                out[name] = None
+    return out

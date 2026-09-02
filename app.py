@@ -61,8 +61,24 @@ else:
     bot = Bot(token=BOT_TOKEN, session=session, parse_mode="HTML")
 dp = Dispatcher(storage=SQLiteStorage(DB_PATH))
 
-from handlers import admin, debts, start  # noqa: E402  (routers need `bot` above)
 
+@dp.update.outer_middleware()
+async def track_activity(handler, event, data):
+    """Stamp last_active so retention can be measured. Done as middleware so
+    no handler has to remember to do it."""
+    user = data.get("event_from_user")
+    if user:
+        try:
+            await db.touch_user(user.id)
+        except Exception as e:  # noqa: BLE001 - never block an update over analytics
+            logger.debug("touch_user failed: %s", e)
+    return await handler(event, data)
+
+from handlers import admin, debts, sharing, start  # noqa: E402  (routers need `bot` above)
+
+# sharing first: it claims /start with a deep-link payload, which the plain
+# /start handler in `start` would otherwise swallow.
+dp.include_router(sharing.router)
 dp.include_router(start.router)
 dp.include_router(debts.router)
 dp.include_router(admin.router)

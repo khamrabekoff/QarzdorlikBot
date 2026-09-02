@@ -270,14 +270,38 @@ async def back_to_list(callback: types.CallbackQuery, state: FSMContext):
 async def open_debt(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     _, debt_id, back_to = callback.data.split(":")
-    lang = await db.get_user_lang(callback.from_user.id)
+    uid = callback.from_user.id
+    lang = await db.get_user_lang(uid)
     debt = await db.get_debt(int(debt_id))
-    if not debt or debt["user_id"] != callback.from_user.id:
+
+    is_mine = bool(debt and debt["user_id"] == uid)
+    is_counterparty = bool(
+        debt and debt["counterparty_id"] == uid and debt["share_status"] == "accepted"
+    )
+    if not debt or not (is_mine or is_counterparty):
         await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
         return
+
+    owner_name = None
+    if not is_mine:
+        owner = await db.get_user(debt["user_id"])
+        owner_name = (owner and owner["username"] and "@" + owner["username"]) or "?"
+
+    # get_debt returns the raw row, so the mirrored direction has to be
+    # supplied here rather than read from the shared-view query.
+    view = dict(debt)
+    view["view_type"] = debt["debt_type"] if is_mine else (
+        "borrowed" if debt["debt_type"] == "lent" else "lent"
+    )
+    view["is_mine"] = 1 if is_mine else 0
+
     await callback.answer()
-    await _edit(callback, views.debt_card(debt, lang),
-                kb.debt_card_kb(debt["id"], lang, back_to))
+    await _edit(
+        callback,
+        views.debt_card(view, lang, owner_name=owner_name),
+        kb.debt_card_kb(debt["id"], lang, back_to, is_mine=is_mine,
+                        shareable=is_mine and debt["share_status"] != "accepted"),
+    )
 
 
 @router.callback_query(F.data.startswith("close:"))
