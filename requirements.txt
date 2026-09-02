@@ -1,0 +1,6 @@
+aiogram
+aiosqlite
+apscheduler
+python-dotenv
+aiohttp_socks
+flask
