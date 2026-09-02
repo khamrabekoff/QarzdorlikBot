@@ -3,7 +3,9 @@ from utils import days_until, fmt_amount, fmt_date, i18n
 
 
 def due_phrase(iso_date, lang):
-    """'осталось 5 дн.' / 'просрочено на 3 дн.' / 'сегодня'."""
+    """'осталось 5 дн.' / 'просрочено на 3 дн.' / 'сегодня' / 'без срока'."""
+    if not iso_date:
+        return i18n.get("no_deadline", lang)
     n = days_until(iso_date)
     if n is None:
         return fmt_date(iso_date)
@@ -14,6 +16,12 @@ def due_phrase(iso_date, lang):
     if n > 0:
         return i18n.get("days_left", lang, n=n)
     return i18n.get("days_overdue", lang, n=abs(n))
+
+
+def _when(iso_date, lang):
+    """Date plus its human phrase, or just the phrase when open-ended."""
+    phrase = due_phrase(iso_date, lang)
+    return f"{fmt_date(iso_date)} — <i>{phrase}</i>" if iso_date else f"<i>{phrase}</i>"
 
 
 def _totals_line(rows, lang):
@@ -61,10 +69,13 @@ def debt_list_card(debts, debt_type, lang):
 
         overdue = (days_until(d["due_date"]) or 0) < 0
         marker = "⚠️" if overdue else "▫️"
+        when = due_phrase(d["due_date"], lang)
+        if d["due_date"]:
+            when = f"{fmt_date(d['due_date'])} — {when}"
         text += (
             f"{marker} <b>{idx}. {d['person_name']}</b>\n"
             f"     {fmt_amount(remaining)} {d['currency']}\n"
-            f"     <i>{fmt_date(d['due_date'])} — {due_phrase(d['due_date'], lang)}</i>\n"
+            f"     <i>{when}</i>\n"
         )
         if d["paid_amount"]:
             text += f"     <i>{i18n.get('card_paid', lang, paid=fmt_amount(d['paid_amount']), currency=d['currency'])}</i>\n"
@@ -85,7 +96,7 @@ def debt_card(debt, lang):
         f"<i>{direction}</i>\n"
         + "━" * 18 + "\n\n"
         f"💵 {fmt_amount(debt['amount'])} {debt['currency']}\n"
-        f"📅 {fmt_date(debt['due_date'])} — <i>{due_phrase(debt['due_date'], lang)}</i>\n"
+        f"📅 {_when(debt['due_date'], lang)}\n"
     )
     if debt["paid_amount"]:
         text += "\n" + i18n.get("card_paid", lang,
@@ -104,7 +115,7 @@ def confirm_card(data, lang):
         f"👤 <b>{data['person_name']}</b>\n"
         f"<i>{direction}</i>\n\n"
         f"💵 <b>{fmt_amount(data['amount'])} {data['currency']}</b>\n"
-        f"📅 {fmt_date(data['due_date'])} — <i>{due_phrase(data['due_date'], lang)}</i>"
+        f"📅 {_when(data['due_date'], lang)}"
     )
 
 

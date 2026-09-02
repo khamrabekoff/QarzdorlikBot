@@ -1,7 +1,11 @@
 """Onboarding, home screen and settings.
 
-Onboarding is deliberately two taps: pick a language, share a phone. Every
-extra question here costs users who would otherwise have stayed.
+Onboarding is one tap: pick a language, then straight to the bot.
+
+The previous version demanded a phone number before showing anything. Nothing
+in the codebase ever read that number - it was pure friction at the exact
+moment a stranger decides whether this bot is worth trusting, and it collected
+personal data for no purpose. Removed.
 """
 import logging
 
@@ -12,7 +16,6 @@ from aiogram.fsm.context import FSMContext
 import database as db
 import keyboards as kb
 import views
-from states import Registration
 from utils import days_until, i18n
 
 router = Router()
@@ -35,8 +38,8 @@ async def show_home(message: types.Message, user_id: int, lang: str):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user = await db.get_user(message.from_user.id)
-    if user and user["phone_number"]:
-        await show_home(message, message.from_user.id, user["language"] or "uz")
+    if user and user["language"]:
+        await show_home(message, message.from_user.id, user["language"])
     else:
         await db.upsert_user(message.from_user.id, username=message.from_user.username)
         await message.answer(i18n.get("choose_lang"), reply_markup=kb.lang_kb())
@@ -47,40 +50,25 @@ async def pick_language(callback: types.CallbackQuery, state: FSMContext):
     lang = callback.data.split(":", 1)[1]
     if lang not in ("uz", "ru"):
         lang = "uz"
+    user_before = await db.get_user(callback.from_user.id)
     await db.upsert_user(callback.from_user.id, language=lang)
     await callback.answer()
 
-    user = await db.get_user(callback.from_user.id)
-    if user and user["phone_number"]:
-        # Language change from settings - straight back home.
+    had_language = bool(user_before and user_before["language"])
+    if had_language:
         await callback.message.edit_text(i18n.get("lang_changed", lang))
-        await show_home(callback.message, callback.from_user.id, lang)
-        return
-
-    await callback.message.edit_text(i18n.get("welcome", lang))
-    await callback.message.answer(i18n.get("ask_phone", lang), reply_markup=kb.phone_kb(lang))
-    await state.set_state(Registration.sending_phone)
+    else:
+        await callback.message.edit_text(i18n.get("welcome", lang))
+    await show_home(callback.message, callback.from_user.id, lang)
 
 
 @router.message(F.contact)
 async def got_contact(message: types.Message, state: FSMContext):
-    """Accepted in any state - a contact can only mean one thing, and making
-    it state-dependent left users stuck if their state had been lost."""
+    """Someone whose old keyboard still shows the removed phone button. Accept
+    it gracefully rather than leaving them staring at no response."""
     lang = await db.get_user_lang(message.from_user.id)
-    await db.upsert_user(
-        message.from_user.id,
-        username=message.from_user.username,
-        phone=message.contact.phone_number,
-    )
     await state.clear()
-    await message.answer(i18n.get("registered", lang), reply_markup=kb.main_kb(lang))
     await show_home(message, message.from_user.id, lang)
-
-
-@router.message(Registration.sending_phone)
-async def nudge_for_contact(message: types.Message):
-    lang = await db.get_user_lang(message.from_user.id)
-    await message.answer(i18n.get("ask_phone", lang), reply_markup=kb.phone_kb(lang))
 
 
 # ---------- settings ----------

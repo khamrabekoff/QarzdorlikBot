@@ -156,7 +156,8 @@ async def get_active_debts(user_id: int, debt_type: Optional[str] = None):
         if debt_type:
             query += " AND debt_type = ?"
             params.append(debt_type)
-        query += " ORDER BY due_date ASC, id ASC"
+        # NULLs (open-ended debts) sort last, not first as SQLite would default to.
+        query += " ORDER BY due_date IS NULL, due_date ASC, id ASC"
         async with db.execute(query, params) as cur:
             return await cur.fetchall()
 
@@ -178,21 +179,27 @@ async def get_debt(debt_id: int):
             return await cur.fetchone()
 
 
-async def get_debts_needing_reminder(today_iso: str):
-    """Only debts actually due (or overdue) and not yet reminded today.
+async def get_debts_needing_reminder(today_iso: str, horizon_iso: str = None):
+    """Debts worth reminding about today.
+
+    The window reaches a few days into the future so an early warning can be
+    sent before the deadline - finding out on the day itself is too late to
+    act on. Open-ended debts (due_date NULL) are never reminded about.
 
     The old version pulled every active debt of every user on each sweep and
     filtered in Python; this pushes the filter into SQL where the index helps.
     """
+    horizon_iso = horizon_iso or today_iso
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
             SELECT * FROM debts
             WHERE status = 'active'
+              AND due_date IS NOT NULL
               AND due_date <= ?
               AND (last_reminded_at IS NULL OR DATE(last_reminded_at) < ?)
             ORDER BY due_date ASC
-        """, (today_iso, today_iso)) as cur:
+        """, (horizon_iso, today_iso)) as cur:
             return await cur.fetchall()
 
 

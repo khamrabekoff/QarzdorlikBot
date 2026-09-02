@@ -123,6 +123,12 @@ async def _ask_date(message: types.Message, state: FSMContext, lang):
 @router.callback_query(F.data.startswith("date:"), AddDebt.entering_date)
 async def picked_date(callback: types.CallbackQuery, state: FSMContext):
     choice = callback.data.split(":", 1)[1]
+    if choice == "none":
+        # An open-ended debt: recorded, listed last, never reminded about.
+        await callback.answer()
+        await _show_confirm(callback.message, state, None, edit_from=callback,
+                            user_id=callback.from_user.id)
+        return
     iso = {
         "d3": lambda: shift_date(days=3),
         "w1": lambda: shift_date(weeks=1),
@@ -132,7 +138,8 @@ async def picked_date(callback: types.CallbackQuery, state: FSMContext):
         "em": lambda: shift_date(end_of="month"),
     }.get(choice, lambda: shift_date(days=7))()
     await callback.answer()
-    await _show_confirm(callback.message, state, iso, edit_from=callback)
+    await _show_confirm(callback.message, state, iso, edit_from=callback,
+                        user_id=callback.from_user.id)
 
 
 @router.message(AddDebt.entering_date)
@@ -143,15 +150,15 @@ async def typed_date(message: types.Message, state: FSMContext):
     if not iso:
         await message.answer(i18n.get("err_date", lang))
         return
-    await _show_confirm(message, state, iso)
+    await _show_confirm(message, state, iso, user_id=message.from_user.id)
 
 
-async def _show_confirm(message, state: FSMContext, iso_date, edit_from=None):
+async def _show_confirm(message, state: FSMContext, iso_date, edit_from=None, user_id=None):
     data = await state.get_data()
     lang = data.get("lang", "uz")
-    currency = data.get("currency") or await _last_currency(
-        (edit_from or message).from_user.id if edit_from else message.chat.id
-    )
+    # user_id is passed explicitly: `message` here may be a callback's message,
+    # whose from_user is the BOT, not the person we want the currency for.
+    currency = data.get("currency") or await _last_currency(user_id or message.chat.id)
     await state.update_data(due_date=iso_date, currency=currency)
 
     payload = {
@@ -201,7 +208,8 @@ async def picked_currency(callback: types.CallbackQuery, state: FSMContext):
 async def save_debt(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     lang = data.get("lang", "uz")
-    required = ("debt_type", "person_name", "amount", "due_date")
+    # due_date is intentionally absent: an open-ended debt stores NULL.
+    required = ("debt_type", "person_name", "amount")
     if not all(data.get(k) for k in required):
         await callback.answer(i18n.get("err_generic", lang), show_alert=True)
         await state.clear()
@@ -213,7 +221,7 @@ async def save_debt(callback: types.CallbackQuery, state: FSMContext):
         amount=data["amount"],
         currency=data.get("currency") or DEFAULT_CURRENCY,
         person_name=data["person_name"],
-        due_date=data["due_date"],
+        due_date=data.get("due_date"),
     )
     await state.clear()
     await callback.answer()

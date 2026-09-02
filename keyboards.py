@@ -22,6 +22,10 @@ DATE_CHOICES = [
     ("btn_end_month", "date:em"),
 ]
 
+# Kept out of DATE_CHOICES so it gets its own full-width row - it is a
+# different kind of answer, not another preset offset.
+NO_DEADLINE = ("btn_no_deadline", "date:none")
+
 
 def main_kb(lang):
     return ReplyKeyboardMarkup(
@@ -81,6 +85,8 @@ def date_kb(lang):
             row = []
     if row:
         rows.append(row)
+    key, data = NO_DEADLINE
+    rows.append([InlineKeyboardButton(text=i18n.get(key, lang), callback_data=data)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

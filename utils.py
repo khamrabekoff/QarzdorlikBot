@@ -61,7 +61,9 @@ def fmt_amount(val) -> str:
 
 
 def fmt_date(iso_str) -> str:
-    """Stored ISO -> displayed DD.MM.YYYY."""
+    """Stored ISO -> displayed DD.MM.YYYY. None means an open-ended debt."""
+    if not iso_str:
+        return ""
     try:
         return datetime.strptime(str(iso_str), "%Y-%m-%d").strftime("%d.%m.%Y")
     except (ValueError, TypeError):
@@ -69,6 +71,8 @@ def fmt_date(iso_str) -> str:
 
 
 def days_until(iso_str):
+    if not iso_str:
+        return None
     try:
         due = datetime.strptime(str(iso_str), "%Y-%m-%d").date()
     except (ValueError, TypeError):
