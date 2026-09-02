@@ -25,9 +25,13 @@ import time
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Update
 from flask import Flask, jsonify, request
+
+try:  # aiogram >= 3.7
+    from aiogram.client.default import DefaultBotProperties
+except ImportError:  # older 3.x took parse_mode directly
+    DefaultBotProperties = None
 
 import database as db
 from config import (
@@ -50,11 +54,11 @@ if PROXY_URL:
     from aiogram.client.session.aiohttp import AiohttpSession
     session = AiohttpSession(proxy=PROXY_URL)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    session=session,
-    default=DefaultBotProperties(parse_mode="HTML"),
-)
+if DefaultBotProperties is not None:
+    bot = Bot(token=BOT_TOKEN, session=session,
+              default=DefaultBotProperties(parse_mode="HTML"))
+else:
+    bot = Bot(token=BOT_TOKEN, session=session, parse_mode="HTML")
 dp = Dispatcher(storage=SQLiteStorage(DB_PATH))
 
 from handlers import admin, debts, start  # noqa: E402  (routers need `bot` above)

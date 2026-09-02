@@ -3,7 +3,12 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from THIS file's directory, not the process's working directory.
+# Under WSGI the cwd is not the project folder, so a bare load_dotenv()
+# finds nothing and every setting silently falls back to its default.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_HERE, '.env'))
+load_dotenv()  # also honour a .env found the usual way, if any
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
