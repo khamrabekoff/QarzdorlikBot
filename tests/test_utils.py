@@ -102,3 +102,15 @@ def test_debt_card_escapes_user_input():
     text = views.debt_card(debt, "uz")
     assert "&lt;script&gt;&amp;" in text
     assert_valid_html(text)
+
+
+def test_cards_stay_small():
+    """Every card goes through PythonAnywhere's slow proxy; size is speed."""
+    import cards
+    debts = [{"id": i, "user_id": 1, "debt_type": "lent", "view_type": "lent", "is_mine": 1,
+              "amount": 1000 * i, "paid_amount": 0, "currency": "so'm", "person_name": f"Odam {i}",
+              "due_date": None, "description": "", "share_status": None, "created_at": None,
+              "owner_username": None, "owner_first_name": None} for i in range(1, 9)]
+    totals = [{"debt_type": "lent", "currency": "so'm", "remaining": 36000}]
+    png = cards.render_home(totals, views.group_people(debts), "uz")
+    assert len(png) < 60 * 1024
