@@ -16,10 +16,11 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile
 
+import cards
 import database as db
 import keyboards as kb
 import views
-from handlers.common import edit_or_send
+from handlers.common import edit_or_send, show_card
 from keyboards import CURRENCIES
 from utils import days_until, fmt_date, fmt_paid_csv, fmt_ts, i18n, lang_from_code, now_local
 
@@ -51,14 +52,17 @@ async def render_home(bot, user_id: int, lang: str, flt: str = "all", page: int 
     soon = sum(1 for d in debts if 0 <= (days_until(d["due_date"]) or 99) <= 3)
     counts = {f: len(views.group_people(filter_debts(debts, f))) for f in ("in", "out", "late")}
     people = views.group_people(filter_debts(debts, flt))
+    pages = max(1, -(-len(people) // kb.PEOPLE_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
 
     text = views.home_card(totals, overdue, soon, lang, filtered_empty=bool(debts) and not people)
-    markup = kb.home_kb(people, flt, page, counts, lang)
-    if callback:
-        await edit_or_send(callback, text, markup)
-        return
-    await _ensure_menu(bot, user_id, lang)
-    await bot.send_message(user_id, text, reply_markup=markup)
+    png = cards.render_home(totals, people, lang, flt, page, kb.PEOPLE_PER_PAGE)
+    # Without a picture (no Pillow) the buttons must carry the amounts.
+    markup = kb.home_kb(people, flt, page, counts, lang, with_amounts=png is None)
+    caption = i18n.get("home_pick" if people else "home_hint_add", lang)
+    if not callback:
+        await _ensure_menu(bot, user_id, lang)
+    await show_card(bot, user_id, png, caption, markup, text, callback=callback)
 
 
 async def _ensure_menu(bot, user_id, lang):
@@ -98,11 +102,17 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "cancel")
 async def cancel_button(callback: types.CallbackQuery, state: FSMContext):
-    """Back to the home screen, in the same message."""
+    """Back to the home screen. A text step (e.g. 'who and how much?') is
+    marked cancelled and the home card comes after it; a caption step on a
+    picture turns back into the home picture in place."""
     await state.clear()
     lang = await db.get_user_lang(callback.from_user.id)
     await callback.answer(i18n.get("cancelled", lang))
-    await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
+    if getattr(callback.message, "photo", None):
+        await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
+        return
+    await edit_or_send(callback, i18n.get("cancelled", lang))
+    await render_home(callback.bot, callback.from_user.id, lang)
 
 
 @router.callback_query(F.data.startswith("h:"))

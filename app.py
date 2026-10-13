@@ -27,6 +27,7 @@ import hmac
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -301,7 +302,9 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "bot": "running", "version": BOT_VERSION}), 200
+    import cards
+    return jsonify({"status": "ok", "bot": "running", "version": BOT_VERSION,
+                    "cards": cards.AVAILABLE}), 200
 
 
 @app.route("/status/<secret>", methods=["GET"])
@@ -350,6 +353,18 @@ def deploy(secret):
             ["git", "pull"], cwd=repo_dir, capture_output=True, text=True, timeout=60
         )
         git_output = (result.stdout + result.stderr).strip()
+
+        # New dependency? Install it into this app's own virtualenv, so a
+        # deploy never needs someone at the PythonAnywhere console.
+        pip_output = None
+        if "requirements.txt" in git_output or request.args.get("pip") == "1":
+            cmd = [os.path.join(sys.prefix, "bin", "python"), "-m", "pip", "install", "-q",
+                   "-r", os.path.join(repo_dir, "requirements.txt")]
+            if PROXY_URL:
+                cmd += ["--proxy", PROXY_URL]
+            pip = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True, timeout=280)
+            pip_output = f"exit {pip.returncode}: " + (pip.stdout + pip.stderr).strip()[-800:]
+
         wsgi_file = f"/var/www/{WEBHOOK_DOMAIN.replace('.', '_')}_wsgi.py"
         try:
             os.utime(wsgi_file, None)  # touching it makes PythonAnywhere reload
@@ -357,7 +372,8 @@ def deploy(secret):
         except Exception as e:  # noqa: BLE001
             reload_status = f"touch failed: {e}"
         logger.info("Deploy: %s | %s", git_output[:300], reload_status)
-        return jsonify({"status": "ok", "git": git_output, "reload": reload_status}), 200
+        return jsonify({"status": "ok", "git": git_output, "pip": pip_output,
+                        "reload": reload_status}), 200
     except Exception as e:  # noqa: BLE001
         return jsonify({"status": "error", "message": str(e)}), 500
 

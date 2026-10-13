@@ -22,7 +22,7 @@ import pytest  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
-from aiogram.types import CallbackQuery, Chat, Message, Update, User  # noqa: E402
+from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User  # noqa: E402
 
 import app as bot_app  # noqa: E402  (creates the schema in _DB)
 
@@ -74,6 +74,13 @@ class FakeTelegram(BaseSession):
             chat_id = getattr(method, "chat_id", None) or 1
             return Message(message_id=next(self._ids), date=datetime.now(),
                            chat=Chat(id=chat_id, type="private"), text=text or "")
+        if name in ("SendPhoto", "EditMessageMedia", "EditMessageCaption"):
+            if name == "SendPhoto":
+                assert method.photo.data[:8] == b"\x89PNG\r\n\x1a\n", "card must be a real PNG"
+            chat_id = getattr(method, "chat_id", None) or 1
+            return Message(message_id=next(self._ids), date=datetime.now(),
+                           chat=Chat(id=chat_id, type="private"), caption=text,
+                           photo=[PhotoSize(file_id="f", file_unique_id="u", width=1440, height=900)])
         if name == "GetMe":
             return User(id=42, is_bot=True, first_name="Qarz", username="qarz_test_bot")
         return True
@@ -100,7 +107,17 @@ class FakeTelegram(BaseSession):
     def texts(self, chat_id=None):
         return [getattr(m, "text", None) or getattr(m, "caption", None) or ""
                 for m in self.sent(chat_id=chat_id)
-                if type(m).__name__ in ("SendMessage", "EditMessageText", "SendDocument")]
+                if type(m).__name__ in ("SendMessage", "EditMessageText", "SendDocument",
+                                        "SendPhoto", "EditMessageCaption")]
+
+    def screens(self):
+        """Type names of everything that put something on screen, in order."""
+        return [type(m).__name__ for m in self.calls if type(m).__name__ in (
+            "SendMessage", "EditMessageText", "SendPhoto", "EditMessageMedia", "EditMessageCaption")]
+
+    def people_buttons(self):
+        rows = getattr(self.last_markup(), "inline_keyboard", None) or []
+        return [b.text for row in rows for b in row if (b.callback_data or "").startswith("p:")]
 
     def last_text(self, chat_id=None):
         texts = self.texts(chat_id)
@@ -169,10 +186,13 @@ class Chatter:
                       chat=Chat(id=self.uid, type="private"), from_user=self.user, text=text)
         await bot_app.dp.feed_update(self.bot, Update(update_id=next(_update_ids), message=msg))
 
-    async def tap(self, data):
+    async def tap(self, data, on_photo=False):
+        """Press a button. on_photo: the button sits under a picture card."""
+        extra = ({"photo": [PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)]}
+                 if on_photo else {"text": "card"})
         on = Message(message_id=next(_update_ids), date=datetime.now(),
                      chat=Chat(id=self.uid, type="private"),
-                     from_user=User(id=42, is_bot=True, first_name="Qarz"), text="card")
+                     from_user=User(id=42, is_bot=True, first_name="Qarz"), **extra)
         cq = CallbackQuery(id=str(next(_update_ids)), from_user=self.user, chat_instance="ci",
                            data=data, message=on)
         await bot_app.dp.feed_update(self.bot, Update(update_id=next(_update_ids), callback_query=cq))

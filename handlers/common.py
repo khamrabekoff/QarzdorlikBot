@@ -2,24 +2,78 @@
 import logging
 
 from aiogram import Bot, types
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 
 import database as db
 from utils import display_name, esc, fmt_amount, fmt_date, i18n
 
 logger = logging.getLogger(__name__)
 
+CAPTION_LIMIT = 1024
 
-async def edit_or_send(callback: types.CallbackQuery, text, markup=None):
-    """Edit the card in place; if that's impossible (message too old, deleted,
-    or not text), send a fresh one rather than leaving the tap unanswered."""
+
+def _is_photo(message) -> bool:
+    return bool(getattr(message, "photo", None))
+
+
+async def delete_message(message):
     try:
-        await callback.message.edit_text(text, reply_markup=markup)
-        return
+        await message.delete()
+    except Exception as e:  # noqa: BLE001 - too old to delete, already gone...
+        logger.debug("delete failed: %s", e)
+
+
+async def edit_or_send(callback: types.CallbackQuery, text, markup=None, keep_photo=False):
+    """Show `text` in place of the message the button was on.
+
+    On a picture card: with keep_photo the picture stays and the text
+    becomes its caption (small steps like 'what to edit?'); otherwise the
+    picture is replaced by a fresh text message, so the chat doesn't keep
+    an outdated card above it."""
+    msg = callback.message
+    try:
+        if _is_photo(msg):
+            if keep_photo and len(text) <= CAPTION_LIMIT:
+                await msg.edit_caption(caption=text, reply_markup=markup)
+                return
+            await delete_message(msg)
+        else:
+            await msg.edit_text(text, reply_markup=markup)
+            return
     except Exception as e:  # noqa: BLE001
         if "not modified" in str(e).lower():
             return
-        logger.debug("edit_text failed, sending instead: %s", e)
+        logger.debug("edit failed, sending instead: %s", e)
     await callback.bot.send_message(callback.from_user.id, text, reply_markup=markup)
+
+
+async def show_card(bot: Bot, user_id: int, png, caption, markup, fallback_text,
+                    callback: types.CallbackQuery = None):
+    """Put a picture card on screen - in place when the button was on a
+    picture, as a new message otherwise. Text messages are never deleted
+    for it: a reminder you tapped 'open' on should stay in the chat.
+    Without Pillow (png is None) the text card is used instead."""
+    if png is None:
+        if callback:
+            await edit_or_send(callback, fallback_text, markup)
+        else:
+            await bot.send_message(user_id, fallback_text, reply_markup=markup)
+        return
+
+    photo = BufferedInputFile(png, filename="card.png")
+    caption = caption if caption and len(caption) <= CAPTION_LIMIT else None
+    if callback and _is_photo(callback.message):
+        try:
+            await callback.message.edit_media(
+                InputMediaPhoto(media=photo, caption=caption, parse_mode="HTML"), reply_markup=markup)
+            return
+        except Exception as e:  # noqa: BLE001
+            if "not modified" in str(e).lower():
+                return
+            logger.debug("edit_media failed, sending instead: %s", e)
+            await delete_message(callback.message)
+            photo = BufferedInputFile(png, filename="card.png")
+    await bot.send_photo(user_id, photo, caption=caption, reply_markup=markup)
 
 
 async def user_display(user_id: int) -> str:

@@ -16,10 +16,11 @@ from aiogram import Bot, F, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
+import cards
 import database as db
 import keyboards as kb
 import views
-from handlers.common import edit_or_send, notify_counterparty, user_display
+from handlers.common import delete_message, edit_or_send, notify_counterparty, show_card, user_display
 from handlers.start import render_home
 from keyboards import CURRENCIES
 from states import AddDebt, Edit, Pay
@@ -354,7 +355,13 @@ async def open_person(callback: types.CallbackQuery, state: FSMContext):
     if len(person["debts"]) == 1:
         await _show_card(callback, person["debts"][0]["id"], lang)
         return
-    await edit_or_send(callback, views.person_card(person, lang), kb.person_kb(person, lang))
+    await _show_person(callback, person, lang)
+
+
+async def _show_person(callback, person, lang):
+    await show_card(callback.bot, callback.from_user.id, cards.render_person(person, lang),
+                    i18n.get("list_pick", lang), kb.person_kb(person, lang),
+                    views.person_card(person, lang), callback=callback)
 
 
 @router.callback_query(F.data.startswith("pp:"))
@@ -367,13 +374,14 @@ async def back_to_person(callback: types.CallbackQuery, state: FSMContext):
     if not person or len(person["debts"]) == 1:
         await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
         return
-    await edit_or_send(callback, views.person_card(person, lang), kb.person_kb(person, lang))
+    await _show_person(callback, person, lang)
 
 
 # ---------- one debt ----------
 
 async def _card(debt, uid, lang):
-    """(text, markup) for a debt as `uid` sees it, or None if they can't."""
+    """The debt as `uid` sees it: {text, markup, png, caption}, or None if
+    they may not see it. `text` is the fallback when there is no picture."""
     if not debt:
         return None
     is_mine = debt["user_id"] == uid
@@ -387,23 +395,30 @@ async def _card(debt, uid, lang):
     owner_name = None if is_mine else await user_display(debt["user_id"])
 
     if debt["status"] != "active":
-        return views.closed_card(debt, lang), kb.row_kb(
-            (i18n.get("btn_to_list", lang), f"list:{view['view_type']}"))
+        return {"text": views.closed_card(debt, lang), "png": None, "caption": None,
+                "markup": kb.row_kb((i18n.get("btn_to_list", lang), f"list:{view['view_type']}"))}
 
     markup = kb.debt_card_kb(debt["id"], lang, view["view_type"], is_mine=is_mine,
                              shareable=is_mine and debt["share_status"] != "accepted")
-    return views.debt_card(view, lang, owner_name=owner_name), markup
+    title = debt["person_name"] if is_mine else owner_name
+    caption = None if is_mine else i18n.get("readonly_hint", lang, owner=esc(owner_name))
+    return {"text": views.debt_card(view, lang, owner_name=owner_name), "markup": markup,
+            "png": cards.render_debt(view, lang, title, is_mine=is_mine), "caption": caption}
 
 
-async def _show_card(callback: types.CallbackQuery, debt_id, lang, new_message=False):
+async def _present(bot: Bot, uid, card, callback=None, note=None):
+    """Show a _card() result. `note` (e.g. 'Saved') goes above it."""
+    caption = "\n\n".join(x for x in (note, card["caption"]) if x) or None
+    text = "\n\n".join(x for x in (note, card["text"]) if x)
+    await show_card(bot, uid, card["png"], caption, card["markup"], text, callback=callback)
+
+
+async def _show_card(callback: types.CallbackQuery, debt_id, lang, note=None):
     card = await _card(await db.get_debt(debt_id), callback.from_user.id, lang)
     if not card:
         await callback.bot.send_message(callback.from_user.id, i18n.get("err_not_found", lang))
         return
-    if new_message:
-        await callback.bot.send_message(callback.from_user.id, card[0], reply_markup=card[1])
-    else:
-        await edit_or_send(callback, *card)
+    await _present(callback.bot, callback.from_user.id, card, callback=callback, note=note)
 
 
 @router.callback_query(F.data.startswith("debt:"))
@@ -416,7 +431,7 @@ async def open_debt(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
         return
     await callback.answer()
-    await edit_or_send(callback, *card)
+    await _present(callback.bot, callback.from_user.id, card, callback=callback)
 
 
 async def _own_active_debt(callback: types.CallbackQuery, state: FSMContext = None):
@@ -468,7 +483,10 @@ async def reopen(callback: types.CallbackQuery):
         await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
         return
     await callback.answer(i18n.get("debt_reopened", lang))
-    await _show_card(callback, debt_id, lang)
+    # The "closed" message has served its purpose; the live card replaces it.
+    await delete_message(callback.message)
+    card = await _card(await db.get_debt(debt_id), callback.from_user.id, lang)
+    await _present(callback.bot, callback.from_user.id, card, note=i18n.get("debt_reopened", lang))
     await notify_counterparty(callback.bot, await db.get_debt(debt_id), "notify_reopened")
 
 
@@ -479,7 +497,7 @@ async def ask_delete(callback: types.CallbackQuery):
         return
     await callback.answer()
     await edit_or_send(callback, i18n.get("confirm_delete", lang),
-                       kb.confirm_delete_kb(debt["id"], lang, debt["debt_type"]))
+                       kb.confirm_delete_kb(debt["id"], lang, debt["debt_type"]), keep_photo=True)
 
 
 @router.callback_query(F.data.startswith("delyes:"))
@@ -593,7 +611,7 @@ async def edit_menu(callback: types.CallbackQuery, state: FSMContext):
         return
     await callback.answer()
     await edit_or_send(callback, i18n.get("edit_title", lang),
-                       kb.edit_kb(debt["id"], lang, debt["debt_type"]))
+                       kb.edit_kb(debt["id"], lang, debt["debt_type"]), keep_photo=True)
 
 
 @router.callback_query(F.data.startswith("ef:"))
@@ -608,13 +626,15 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(Edit.value)
-    await state.update_data(debt_id=debt["id"], field=field, lang=lang)
+    # Remember the prompt so a typed answer can replace it with the result.
+    await state.update_data(debt_id=debt["id"], field=field, lang=lang,
+                            prompt_msg=callback.message.message_id)
     await callback.answer()
 
     if field == "due":
         await edit_or_send(callback, i18n.get("edit_ask_date", lang),
                            kb.date_kb(lang, prefix=f"rd:{debt['id']}",
-                                      back=f"debt:{debt['id']}:{debt['debt_type']}"))
+                                      back=f"debt:{debt['id']}:{debt['debt_type']}"), keep_photo=True)
         return
 
     prompt = {
@@ -623,7 +643,7 @@ async def edit_field(callback: types.CallbackQuery, state: FSMContext):
                            currency=esc(debt["currency"])),
         "note": i18n.get("edit_ask_note", lang),
     }[field]
-    await edit_or_send(callback, prompt, kb.cancel_kb(lang))
+    await edit_or_send(callback, prompt, kb.cancel_kb(lang), keep_photo=True)
 
 
 @router.callback_query(F.data.startswith("rd:"))
@@ -684,6 +704,11 @@ async def got_edit_value(message: types.Message, state: FSMContext):
         return
 
     await state.clear()
+    if data.get("prompt_msg"):
+        try:
+            await message.bot.delete_message(message.chat.id, data["prompt_msg"])
+        except Exception:  # noqa: BLE001 - already gone or too old
+            pass
     await _save_field(message.bot, message.from_user.id, debt, column, value, lang)
 
 
@@ -692,11 +717,7 @@ async def _save_field(bot: Bot, uid, debt, column, value, lang, callback=None):
         await bot.send_message(uid, i18n.get("err_not_found", lang))
         return
     updated = await db.get_debt(debt["id"])
-    text, markup = await _card(updated, uid, lang)
-    text = i18n.get("edit_saved", lang) + "\n\n" + text
-    if callback:
-        await edit_or_send(callback, text, markup)
-    else:
-        await bot.send_message(uid, text, reply_markup=markup)
+    await _present(bot, uid, await _card(updated, uid, lang), callback=callback,
+                   note=i18n.get("edit_saved", lang))
     if column in ("amount", "due_date"):
         await notify_counterparty(bot, updated, "notify_changed")

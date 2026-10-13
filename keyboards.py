@@ -61,7 +61,7 @@ PEOPLE_PER_PAGE = 8
 FILTERS = ("all", "in", "out", "late")
 
 
-def home_kb(people, flt, page, counts, lang):
+def home_kb(people, flt, page, counts, lang, with_amounts=False):
     """Filter chips, one button per person, paging, then actions.
     `counts` = {'in': n, 'out': n, 'late': n} people per filter."""
     labels = {
@@ -78,8 +78,10 @@ def home_kb(people, flt, page, counts, lang):
     pages = max(1, -(-len(people) // PEOPLE_PER_PAGE))
     page = min(max(page, 0), pages - 1)
     for p in people[page * PEOPLE_PER_PAGE:(page + 1) * PEOPLE_PER_PAGE]:
+        # The picture above shows the amounts; the button is just the name.
         dot = "🔴 " if p["overdue"] else ""
-        rows.append([_btn(f"{dot}{p['name']} · {signed_money(p['net'])}", f"p:{p['debts'][0]['id']}")])
+        label = f"{dot}{p['name']}" + (f" · {signed_money(p['net'])}" if with_amounts else "")
+        rows.append([_btn(label, f"p:{p['debts'][0]['id']}")])
 
     if pages > 1:
         nav = []

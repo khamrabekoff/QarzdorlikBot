@@ -26,7 +26,8 @@ async def test_new_user_picks_language_then_lands_home(bot, tg):
     await c.say("/start")
     assert "Tilni tanlang" in tg.last_text()
     await c.tap("lang:ru")
-    assert "Мои долги" in tg.last_text()
+    assert tg.screens()[-1] == "SendPhoto"          # the home card
+    assert "add" in tg.buttons()
     assert (await db.get_user(10))["language"] == "ru"
 
 
@@ -79,7 +80,7 @@ async def test_menu_button_mid_flow_is_not_saved_as_a_name(ali, tg):
     await ali.say("➕ Yangi qarz")
     await ali.tap("type:lent")
     await ali.say("📥 Menga qarzdor")
-    assert "Qarzlarim" in tg.last_text()     # home, filtered
+    assert tg.screens()[-1] == "SendPhoto"   # home, filtered
     await ali.say("Vali 500")          # flow is over: this is now a quick add
     assert "qtype:lent" in tg.buttons()
     assert await _debts(1) == []
@@ -90,7 +91,7 @@ async def test_cancel_button_leaves_the_flow(ali, tg):
     await ali.tap("type:lent")
     await ali.tap("cancel")
     assert any("Bekor qilindi" in a for a in tg.alerts())
-    assert "Qarzlarim" in tg.last_text()     # straight back home
+    assert tg.screens()[-2:] == ["EditMessageText", "SendPhoto"]  # marked cancelled, then home
     await ali.say("salom")
     assert "Ali 500000" in tg.last_text()  # the hint, not 'how much?'
 
@@ -182,7 +183,7 @@ async def test_edit_amount_and_date(ali, tg):
     assert debt["last_reminded_at"] is None  # new deadline, fresh reminders
 
 
-async def test_names_with_html_are_safe_everywhere(ali, tg):
+async def test_names_with_html_are_safe_everywhere(ali, tg, monkeypatch):
     """conftest fails any message with broken HTML."""
     await ali.say("➕ Yangi qarz")
     await ali.tap("type:lent")
@@ -192,6 +193,9 @@ async def test_names_with_html_are_safe_everywhere(ali, tg):
     [debt] = await _debts(1)
     assert debt["person_name"] == "<b>Ali & Co"
     await ali.say("📥 Menga qarzdor")
+    await ali.tap(f"debt:{debt['id']}:lent")
+    import cards
+    monkeypatch.setattr(cards, "AVAILABLE", False)   # the text version is where escaping matters
     await ali.tap(f"debt:{debt['id']}:lent")
     assert "&lt;b&gt;Ali &amp; Co" in tg.last_text()
 
@@ -299,12 +303,10 @@ async def test_home_groups_debts_by_person(ali, tg):
     await db.add_debt(1, "lent", 500, "so'm", "ali  AKA", None)       # same person, typed differently
     await db.add_debt(1, "borrowed", 300, "so'm", "Sardor", None)
     await ali.say("📋 Qarzlarim")
-    labels = [b.text for row in tg.last_markup().inline_keyboard for b in row]
-    assert "Ali aka · +1 500 so'm" in labels
-    assert "Sardor · −300 so'm" in labels
+    assert tg.people_buttons() == ["Ali aka", "Sardor"]  # amounts are on the picture
 
     await ali.tap(f"p:{a1}")                   # two debts -> person page
-    assert "Ali aka" in tg.last_text() and "1 500" in tg.last_text()
+    assert tg.screens()[-1] == "SendPhoto"         # the person card
     assert f"padd:{a1}" in tg.buttons()
 
 
@@ -312,8 +314,8 @@ async def test_person_with_one_debt_opens_it_directly(ali, tg):
     d = await db.add_debt(1, "borrowed", 300, "so'm", "Sardor", None)
     await ali.tap(f"p:{d}")
     assert f"pay:{d}" in tg.buttons()
-    await ali.tap(f"pp:{d}")                   # back -> home, not a one-item list
-    assert "Qarzlarim" in tg.last_text()
+    await ali.tap(f"pp:{d}", on_photo=True)    # back -> home, not a one-item list
+    assert tg.screens()[-1] == "EditMessageMedia" and "add" in tg.buttons()
 
 
 async def test_filters_and_overdue_first(ali, tg):
@@ -322,12 +324,9 @@ async def test_filters_and_overdue_first(ali, tg):
     await db.add_debt(1, "lent", 200, "so'm", "Bobur", late)
     await db.add_debt(1, "borrowed", 50, "so'm", "Sardor", None)
     await ali.tap("h:all:0")
-    labels = [b.text for row in tg.last_markup().inline_keyboard for b in row]
-    people = [t for t in labels if " · " in t]
-    assert people[0].startswith("🔴 Bobur")    # overdue on top
+    assert tg.people_buttons()[0] == "🔴 Bobur"   # overdue on top
     await ali.tap("h:out:0")
-    labels = [b.text for row in tg.last_markup().inline_keyboard for b in row]
-    assert [t for t in labels if " · " in t] == ["Sardor · −50 so'm"]
+    assert tg.people_buttons() == ["Sardor"]
 
 
 async def test_add_more_for_a_person_skips_the_name(ali, tg):
@@ -347,8 +346,7 @@ async def test_home_pages_when_many_people(ali, tg):
     await ali.tap("h:all:0")
     assert "h:all:1" in tg.buttons()
     await ali.tap("h:all:1")
-    labels = [b.text for row in tg.last_markup().inline_keyboard for b in row]
-    assert len([t for t in labels if " · " in t]) == 3
+    assert len(tg.people_buttons()) == 3
 
 
 async def test_bottom_menu_is_sent_once(bot, tg):
@@ -359,3 +357,51 @@ async def test_bottom_menu_is_sent_once(bot, tg):
     await c.say("📋 Qarzlarim")
     menus = [m for m in tg.sent("SendMessage") if type(m.reply_markup).__name__ == "ReplyKeyboardMarkup"]
     assert len(menus) == 1
+
+
+
+# ---------- picture cards ----------
+
+async def test_navigation_between_cards_edits_one_message(ali, tg):
+    d1 = await db.add_debt(1, "lent", 1000, "so'm", "Vali", None)
+    await db.add_debt(1, "lent", 500, "so'm", "Vali", None)
+    tg.clear()
+    await ali.tap(f"p:{d1}", on_photo=True)       # home picture -> person picture
+    await ali.tap(f"debt:{d1}:lent", on_photo=True)
+    await ali.tap(f"pp:{d1}", on_photo=True)
+    assert tg.screens() == ["EditMessageMedia"] * 3
+
+
+async def test_small_steps_keep_the_picture(ali, tg):
+    d = await db.add_debt(1, "lent", 1000, "so'm", "Vali", None)
+    tg.clear()
+    await ali.tap(f"edit:{d}", on_photo=True)
+    await ali.tap(f"del:{d}", on_photo=True)
+    assert tg.screens() == ["EditMessageCaption", "EditMessageCaption"]
+
+
+async def test_typed_edit_replaces_the_prompt(ali, tg):
+    d = await db.add_debt(1, "lent", 1000, "so'm", "Vali", None)
+    await ali.tap(f"ef:{d}:amount", on_photo=True)
+    tg.clear()
+    await ali.say("2000")
+    assert [type(m).__name__ for m in tg.calls][:2] == ["DeleteMessage", "SendPhoto"]
+    assert "O'zgartirildi" in tg.texts()[-1]
+
+
+async def test_reminder_open_keeps_the_reminder(ali, tg):
+    """'Open' on a text reminder sends the card; the reminder stays."""
+    d = await db.add_debt(1, "lent", 1000, "so'm", "Vali", None)
+    tg.clear()
+    await ali.tap(f"debt:{d}:lent")
+    assert tg.screens() == ["SendPhoto"] and not tg.sent("DeleteMessage")
+
+
+async def test_text_fallback_without_pillow(ali, tg, monkeypatch):
+    """A server without Pillow still works - text cards, amounts on buttons."""
+    import cards
+    monkeypatch.setattr(cards, "AVAILABLE", False)
+    await db.add_debt(1, "lent", 1500, "so'm", "Ali aka", None)
+    await ali.say("📋 Qarzlarim")
+    assert tg.screens()[-1] == "SendMessage"
+    assert tg.people_buttons() == ["Ali aka · +1 500 so'm"]
