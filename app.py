@@ -46,11 +46,22 @@ try:  # aiogram >= 3.7
 except ImportError:  # older 3.x took parse_mode directly
     DefaultBotProperties = None
 
-try:  # what aiohttp-socks raises when PythonAnywhere's proxy says 503
-    from python_socks import ProxyError
+# What the proxied session raises when PythonAnywhere's proxy says 503. Note
+# aiohttp_socks re-raises with its OWN ProxyError class, unrelated to
+# python_socks.ProxyError - catching only the latter meant v2.1 never
+# actually retried a proxy failure (seen in the log: "Daily backup failed:
+# 503 Service Unavailable").
+_PROXY_ERRORS = ()
+try:
+    from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+    _PROXY_ERRORS += (ProxyError, ProxyConnectionError, ProxyTimeoutError)
 except ImportError:  # pragma: no cover
-    class ProxyError(Exception):
-        pass
+    pass
+try:
+    import python_socks
+    _PROXY_ERRORS += (python_socks.ProxyError,)
+except ImportError:  # pragma: no cover
+    pass
 
 import database as db
 import ops
@@ -73,15 +84,15 @@ logger = logging.getLogger(__name__)
 
 _NETWORK_ERRORS = (
     TelegramNetworkError, TelegramServerError, aiohttp.ClientError,
-    asyncio.TimeoutError, ConnectionError, ProxyError,
-)
+    asyncio.TimeoutError, ConnectionError,
+) + _PROXY_ERRORS
 
 
 class ResilientRequests(BaseRequestMiddleware):
     """Retry a Telegram call that failed on the way there, and don't let an
     unanswerable button press abort the rest of a handler."""
 
-    ATTEMPTS = 3
+    ATTEMPTS = 4  # the proxy's 503 bursts last a few seconds: 0.6+1.2+1.8 s of waiting
 
     async def __call__(self, make_request, bot, method):
         for attempt in range(1, self.ATTEMPTS + 1):
@@ -228,9 +239,9 @@ async def _housekeeping(from_cron: bool):
     if from_cron:
         await ops.record_cron_run()
         await purge_expired_states(DB_PATH)
-        await ops.daily_backup(bot)
     else:
         await ops.check_cron_alive(bot)
+    await ops.daily_backup(bot)  # traffic retries a backup the cron couldn't deliver
     await ops.keep_host_alive(bot)
     try:
         await ensure_commands()

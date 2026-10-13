@@ -37,9 +37,18 @@ async def test_network_error_is_retried():
     assert flaky.calls == 3
 
 
-async def test_gives_up_after_three_attempts():
+async def test_pythonanywhere_proxy_503_is_retried():
+    """The exact exception from the server log. v2.1 caught python_socks'
+    ProxyError, a different class, so these were never retried."""
+    from aiohttp_socks import ProxyError
+    err = ProxyError("503 Service Unavailable", error_code=503)
+    flaky = _Flaky(err, err, "ok")
+    assert await bot_app.ResilientRequests()(flaky, None, SendMessage(chat_id=1, text="x")) == "ok"
+
+
+async def test_gives_up_after_all_attempts():
     err = TelegramNetworkError(method=SendMessage(chat_id=1, text="x"), message="down")
-    flaky = _Flaky(err, err, err)
+    flaky = _Flaky(*[err] * bot_app.ResilientRequests.ATTEMPTS)
     with pytest.raises(TelegramNetworkError):
         await bot_app.ResilientRequests()(flaky, None, SendMessage(chat_id=1, text="x"))
 
@@ -87,6 +96,17 @@ async def test_recent_cron_is_quiet(bot, tg):
     await ops.record_cron_run()
     await ops.check_cron_alive(bot)
     assert tg.sent("SendMessage") == []
+
+
+async def test_failed_backup_is_retried_later(bot, tg, monkeypatch):
+    async def down(*a, **k):
+        raise ConnectionError("proxy 503")
+    monkeypatch.setattr(ops, "send_backup", down)
+    await ops.daily_backup(bot)
+    assert await db.meta_get("last_backup_date") is None   # not marked done
+    monkeypatch.undo()
+    await ops.daily_backup(bot)
+    assert len(tg.sent("SendDocument")) == 1
 
 
 async def test_daily_backup_runs_once_per_day(bot, tg):

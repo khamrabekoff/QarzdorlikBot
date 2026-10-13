@@ -79,15 +79,17 @@ async def send_backup(bot, silent: bool = False) -> float:
 
 
 async def daily_backup(bot):
-    """Once per calendar day, from whichever trigger runs first."""
+    """Once per calendar day, from whichever trigger runs first. Marked done
+    only once it's actually delivered, so a proxy hiccup means "try again on
+    the next trigger", not "skip today" (which is what happened 2026-10-13)."""
     today = now_local().date().isoformat()
     if await db.meta_get("last_backup_date") == today:
         return
-    await db.meta_set("last_backup_date", today)
     try:
         await send_backup(bot, silent=True)
+        await db.meta_set("last_backup_date", today)
     except Exception as e:  # noqa: BLE001
-        logger.warning("Daily backup failed: %s", e)
+        logger.warning("Daily backup failed (will retry): %s", e)
 
 
 async def record_cron_run():
