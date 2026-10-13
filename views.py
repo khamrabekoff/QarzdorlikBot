@@ -6,7 +6,6 @@ Telegram reject the whole message.
 """
 from utils import days_until, display_name, esc, fmt_amount, fmt_date, fmt_ts, i18n
 
-RULE = "━" * 18
 
 
 def due_phrase(iso_date, lang):
@@ -76,29 +75,100 @@ def _net_line(lent, borrowed):
     return " · ".join(parts)
 
 
-def home_card(totals_rows, overdue_count, soon_count, lang):
-    """Summary the user lands on: what they're owed, what they owe, warnings."""
+def home_card(totals_rows, overdue_count, soon_count, lang, filtered_empty=False):
+    """Summary the user lands on: what they're owed, what they owe, warnings.
+    The people themselves are the buttons underneath (keyboards.home_kb)."""
     lent = [r for r in totals_rows if r["debt_type"] == "lent"]
     borrowed = [r for r in totals_rows if r["debt_type"] == "borrowed"]
 
-    text = i18n.get("home_title", lang) + "\n" + RULE + "\n\n"
+    text = i18n.get("home_title", lang) + "\n\n"
 
     if not lent and not borrowed:
         return text + i18n.get("home_empty", lang)
 
     if lent:
-        text += f"{i18n.get('home_owe_me', lang)}\n<b>{_totals_line(lent)}</b>\n\n"
+        text += f"{i18n.get('home_owe_me', lang)}: <b>{_totals_line(lent)}</b>\n"
     if borrowed:
-        text += f"{i18n.get('home_i_owe', lang)}\n<b>{_totals_line(borrowed)}</b>\n\n"
+        text += f"{i18n.get('home_i_owe', lang)}: <b>{_totals_line(borrowed)}</b>\n"
     if lent and borrowed:
-        text += i18n.get("home_net", lang, totals=_net_line(lent, borrowed)) + "\n\n"
+        text += i18n.get("home_net", lang, totals=_net_line(lent, borrowed)) + "\n"
 
     if overdue_count:
-        text += i18n.get("home_overdue", lang, n=overdue_count) + "\n"
+        text += "\n" + i18n.get("home_overdue", lang, n=overdue_count) + "\n"
     elif soon_count:
-        text += i18n.get("home_soon", lang, n=soon_count) + "\n"
+        text += "\n" + i18n.get("home_soon", lang, n=soon_count) + "\n"
 
+    text += "\n" + i18n.get("home_filter_empty" if filtered_empty else "home_pick", lang)
     return text.rstrip()
+
+
+# ---------- people ----------
+# Debts are grouped by WHO, because that's how people think about them:
+# "what's going on with Ali", not "my lent list, item 4".
+
+def _remaining(d):
+    return (d["amount"] or 0) - (d["paid_amount"] or 0)
+
+
+def person_key(d):
+    """Own debts group by the typed name (case/spacing-insensitive); debts
+    someone else shared with us group by that person's account."""
+    if _get(d, "is_mine", 1):
+        return "n:" + " ".join((d["person_name"] or "").split()).casefold()
+    return f"u:{d['user_id']}"
+
+
+def group_people(debts):
+    people = {}
+    for d in debts:
+        p = people.setdefault(person_key(d), {
+            "name": counterpart_name(d), "debts": [], "net": {}, "overdue": False, "next_due": None,
+        })
+        p["debts"].append(d)
+        sign = 1 if _get(d, "view_type", d["debt_type"]) == "lent" else -1
+        p["net"][d["currency"]] = p["net"].get(d["currency"], 0) + sign * _remaining(d)
+        n = days_until(d["due_date"])
+        if n is not None and n < 0:
+            p["overdue"] = True
+        if d["due_date"] and (p["next_due"] is None or d["due_date"] < p["next_due"]):
+            p["next_due"] = d["due_date"]
+    # Overdue first, then whoever is due soonest, then alphabetical.
+    return sorted(people.values(), key=lambda p: (
+        not p["overdue"], p["next_due"] or "9999-12-31", p["name"].casefold()))
+
+
+def signed_money(net):
+    """{'so'm': 2e6, '$': -100} -> '+2 000 000 so'm · −100 $' (plain text, for buttons)."""
+    parts = []
+    for cur, v in net.items():
+        if abs(v) < 0.005:
+            continue
+        parts.append(f"{'+' if v > 0 else '−'}{fmt_amount(abs(v))} {cur}")
+    return " · ".join(parts) or "0"
+
+
+def person_card(person, lang):
+    name = esc(person["name"])
+    lent = {c: v for c, v in person["net"].items() if v > 0}
+    owed = {c: -v for c, v in person["net"].items() if v < 0}
+    text = f"👤 <b>{name}</b>\n"
+    if lent:
+        text += i18n.get("person_net_lent", lang,
+                         totals=" · ".join(_money(v, c) for c, v in lent.items())) + "\n"
+    if owed:
+        text += i18n.get("person_net_borrowed", lang,
+                         totals=" · ".join(_money(v, c) for c, v in owed.items())) + "\n"
+    text += "\n"
+    for i, d in enumerate(person["debts"], 1):
+        dtype = _get(d, "view_type", d["debt_type"])
+        arrow = "📥" if dtype == "lent" else "📤"
+        late = (days_until(d["due_date"]) or 0) < 0
+        text += (f"{arrow} <b>{i}. {_money(_remaining(d), d['currency'])}</b>"
+                 f"{'  ⚠️' if late else ''}\n"
+                 f"     <i>{_when(d['due_date'], lang)}</i>\n")
+        if _get(d, "description"):
+            text += f"     📝 <i>{esc(d['description'])}</i>\n"
+    return text + "\n" + i18n.get("list_pick", lang)
 
 
 def _list_lines(debts, lang, max_items):
@@ -143,7 +213,7 @@ def debt_list_card(debts, debt_type, lang, max_items=30):
     body, totals = _list_lines(debts, lang, max_items)
     totals_str = " · ".join(_money(v, c) for c, v in totals.items())
     return (
-        f"{header}  ({len(debts)})\n{RULE}\n\n{body}{RULE}\n"
+        f"{header}  ({len(debts)})\n\n{body}"
         + i18n.get("list_total", lang, totals=totals_str)
         + "\n\n" + i18n.get("list_pick", lang)
     )
@@ -161,7 +231,7 @@ def search_card(debts, query, lang, max_items=30):
             f"     {direction}: {_money(remaining, d['currency'])}\n"
             f"     <i>{_when(d['due_date'], lang)}</i>\n\n"
         )
-    return f"{header}\n{RULE}\n\n{lines}" + i18n.get("list_pick", lang)
+    return f"{header}\n\n{lines}" + i18n.get("list_pick", lang)
 
 
 def debt_card(debt, lang, owner_name=None):
@@ -184,7 +254,7 @@ def debt_card(debt, lang, owner_name=None):
     text = (
         f"👤 <b>{esc(title)}</b>{badge}\n"
         f"<i>{direction}</i>\n"
-        f"{RULE}\n\n"
+        "\n"
         f"💵 <b>{fmt_amount(debt['amount'])} {cur}</b>\n"
         f"📅 {_when(debt['due_date'], lang)}\n"
     )
@@ -204,7 +274,7 @@ def debt_card(debt, lang, owner_name=None):
 def confirm_card(data, lang):
     direction = i18n.get("dir_lent" if data["debt_type"] == "lent" else "dir_borrowed", lang)
     text = (
-        f"{i18n.get('confirm_title', lang)}\n{RULE}\n\n"
+        f"{i18n.get('confirm_title', lang)}\n\n"
         f"👤 <b>{esc(data['person_name'])}</b>\n"
         f"<i>{direction}</i>\n\n"
         f"💵 <b>{_money(data['amount'], data['currency'])}</b>\n"
@@ -232,7 +302,7 @@ def closed_card(debt, lang):
 def history_card(debts, lang):
     if not debts:
         return f"{i18n.get('history_title', lang)}\n\n{i18n.get('history_empty', lang)}"
-    text = i18n.get("history_title", lang) + "\n" + RULE + "\n\n"
+    text = i18n.get("history_title", lang) + "\n\n"
     for d in debts[:20]:
         closed = _get(d, "closed_at")
         when = (i18n.get("history_closed_on", lang, date=fmt_ts(closed))

@@ -27,17 +27,53 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 
-async def show_home(message: types.Message, user_id: int, lang: str):
-    """The screen everything returns to."""
+MENU_VERSION = "3"  # bump when main_kb changes, so everyone gets the new one
+
+
+def filter_debts(debts, flt):
+    if flt == "in":
+        return [d for d in debts if d["view_type"] == "lent"]
+    if flt == "out":
+        return [d for d in debts if d["view_type"] == "borrowed"]
+    if flt == "late":
+        return [d for d in debts if (days_until(d["due_date"]) or 0) < 0]
+    return list(debts)
+
+
+async def render_home(bot, user_id: int, lang: str, flt: str = "all", page: int = 0, callback=None):
+    """The screen everything returns to: totals on top, people as buttons.
+    From a button press it edits the message in place."""
+    if flt not in kb.FILTERS:
+        flt = "all"
+    debts = await db.get_active_debts(user_id)
     totals = await db.get_totals(user_id)
-    active = await db.get_active_debts(user_id)
-    overdue = sum(1 for d in active if (days_until(d["due_date"]) or 0) < 0)
-    soon = sum(1 for d in active if 0 <= (days_until(d["due_date"]) or 99) <= 3)
-    await message.bot.send_message(
-        user_id,
-        views.home_card(totals, overdue, soon, lang),
-        reply_markup=kb.main_kb(lang),
-    )
+    overdue = sum(1 for d in debts if (days_until(d["due_date"]) or 0) < 0)
+    soon = sum(1 for d in debts if 0 <= (days_until(d["due_date"]) or 99) <= 3)
+    counts = {f: len(views.group_people(filter_debts(debts, f))) for f in ("in", "out", "late")}
+    people = views.group_people(filter_debts(debts, flt))
+
+    text = views.home_card(totals, overdue, soon, lang, filtered_empty=bool(debts) and not people)
+    markup = kb.home_kb(people, flt, page, counts, lang)
+    if callback:
+        await edit_or_send(callback, text, markup)
+        return
+    await _ensure_menu(bot, user_id, lang)
+    await bot.send_message(user_id, text, reply_markup=markup)
+
+
+async def _ensure_menu(bot, user_id, lang):
+    """The bottom menu is a reply keyboard, which can only ride on its own
+    message - the home card carries inline buttons. Send it once per menu
+    version (and on language change), not with every screen."""
+    key = f"menu:{user_id}"
+    if await db.meta_get(key) == f"{MENU_VERSION}:{lang}":
+        return
+    await bot.send_message(user_id, i18n.get("menu_ready", lang), reply_markup=kb.main_kb(lang))
+    await db.meta_set(key, f"{MENU_VERSION}:{lang}")
+
+
+async def show_home(message: types.Message, user_id: int, lang: str):
+    await render_home(message.bot, user_id, lang)
 
 
 @router.message(Command("start"))
@@ -62,10 +98,33 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "cancel")
 async def cancel_button(callback: types.CallbackQuery, state: FSMContext):
+    """Back to the home screen, in the same message."""
     await state.clear()
     lang = await db.get_user_lang(callback.from_user.id)
+    await callback.answer(i18n.get("cancelled", lang))
+    await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
+
+
+@router.callback_query(F.data.startswith("h:"))
+async def home_nav(callback: types.CallbackQuery, state: FSMContext):
+    """Filter chips, paging and every 'back to home' button."""
+    await state.clear()
+    parts = callback.data.split(":")
+    flt = parts[1] if len(parts) > 1 else "all"
+    try:
+        page = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        page = 0
+    lang = await db.get_user_lang(callback.from_user.id)
     await callback.answer()
-    await edit_or_send(callback, i18n.get("cancelled", lang))
+    await render_home(callback.bot, callback.from_user.id, lang, flt, page, callback=callback)
+
+
+@router.message(F.text.in_(i18n.all_variants("menu_home")))
+async def menu_home(message: types.Message, state: FSMContext):
+    await state.clear()
+    lang = await db.get_user_lang(message.from_user.id)
+    await render_home(message.bot, message.from_user.id, lang)
 
 
 @router.message(Command("help"))
@@ -215,7 +274,7 @@ async def back_home(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     lang = await db.get_user_lang(callback.from_user.id)
     await callback.answer()
-    await show_home(callback.message, callback.from_user.id, lang)
+    await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
 
 
 def default_lang(from_user) -> str:

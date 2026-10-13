@@ -6,7 +6,7 @@
   "menu_owe_me": "📥 Menga qarzdor",
   "menu_i_owe": "📤 Men qarzdorman",
   "menu_settings": "⚙️ Sozlamalar",
-  "home_title": "💰 <b>QARZLARIM</b>",
+  "home_title": "💰 <b>Qarzlarim</b>",
   "home_owe_me": "📥 Menga qarzdor",
   "home_i_owe": "📤 Men qarzdorman",
   "home_empty": "Hozircha qarzlar yo'q.\n\n<i>«➕ Yangi qarz» tugmasi orqali qo'shing.</i>",
@@ -156,5 +156,15 @@
   "cmd_start": "Bosh sahifa",
   "cmd_new": "Yangi qarz",
   "cmd_help": "Yordam",
-  "cmd_cancel": "Bekor qilish"
+  "cmd_cancel": "Bekor qilish",
+  "menu_home": "📋 Qarzlarim",
+  "home_pick": "<i>Kimni ochamiz? 👇</i>",
+  "home_filter_empty": "<i>Bu bo'limda hech kim yo'q.</i>",
+  "filter_all": "Hammasi",
+  "btn_add_more": "➕ Yana qarz",
+  "btn_home": "🏠 Bosh sahifa",
+  "person_net_lent": "Sizga qarzdor: <b>{totals}</b>",
+  "person_net_borrowed": "Siz qarzdorsiz: <b>{totals}</b>",
+  "add_ask_amount_for": "💵 <b>{name}</b> — qancha?\n\n<i>Masalan: 500000 yoki 500k</i>",
+  "menu_ready": "👇 Menyu pastda"
 }

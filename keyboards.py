@@ -14,6 +14,7 @@ from aiogram.types import (
 )
 
 from utils import fmt_amount, i18n
+from views import signed_money
 
 CURRENCIES = ["so'm", "$", "€", "₽"]
 
@@ -44,18 +45,73 @@ def _rows(buttons, per_row):
 
 
 def main_kb(lang):
+    """Two buttons. Everything else lives on the home message itself, which
+    is edited in place as you navigate - no wall of new messages."""
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=i18n.get("menu_add", lang))],
-            [
-                KeyboardButton(text=i18n.get("menu_owe_me", lang)),
-                KeyboardButton(text=i18n.get("menu_i_owe", lang)),
-            ],
-            [KeyboardButton(text=i18n.get("menu_settings", lang))],
-        ],
+        keyboard=[[
+            KeyboardButton(text=i18n.get("menu_add", lang)),
+            KeyboardButton(text=i18n.get("menu_home", lang)),
+        ]],
         resize_keyboard=True,
         input_field_placeholder="Ali 500000",
     )
+
+
+PEOPLE_PER_PAGE = 8
+FILTERS = ("all", "in", "out", "late")
+
+
+def home_kb(people, flt, page, counts, lang):
+    """Filter chips, one button per person, paging, then actions.
+    `counts` = {'in': n, 'out': n, 'late': n} people per filter."""
+    labels = {
+        "all": i18n.get("filter_all", lang),
+        "in": f"📥 {counts.get('in', 0)}",
+        "out": f"📤 {counts.get('out', 0)}",
+        "late": f"⚠️ {counts.get('late', 0)}",
+    }
+    rows = [[_btn(("• " if f == flt else "") + labels[f], f"h:{f}:0")
+             for f in FILTERS if f == "all" or counts.get(f)]]
+    if len(rows[0]) == 1:
+        rows = []  # one chip filters nothing
+
+    pages = max(1, -(-len(people) // PEOPLE_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    for p in people[page * PEOPLE_PER_PAGE:(page + 1) * PEOPLE_PER_PAGE]:
+        dot = "🔴 " if p["overdue"] else ""
+        rows.append([_btn(f"{dot}{p['name']} · {signed_money(p['net'])}", f"p:{p['debts'][0]['id']}")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("◂", f"h:{flt}:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{pages}", f"h:{flt}:{page}"))
+        if page < pages - 1:
+            nav.append(_btn("▸", f"h:{flt}:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([
+        _btn(i18n.get("menu_add", lang), "add"),
+        _btn("⚙️", "settings"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def person_kb(person, lang):
+    debts = person["debts"][:MAX_LIST]
+    rows = _rows([_btn(str(i), f"debt:{d['id']}:{_view_type(d)}") for i, d in enumerate(debts, 1)], 5)
+    first = person["debts"][0]
+    if _is_mine(first):  # can only add to people you track yourself
+        rows.append([_btn(i18n.get("btn_add_more", lang), f"padd:{first['id']}")])
+    rows.append([_btn(i18n.get("btn_back", lang), "h:all:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _is_mine(d):
+    try:
+        return bool(d["is_mine"])
+    except (KeyError, IndexError):
+        return True
 
 
 def lang_kb():
@@ -166,8 +222,9 @@ def _view_type(d):
 
 def debt_card_kb(debt_id, lang, back_to, is_mine=True, shareable=False):
     """Only the owner gets editing buttons; the other party sees it read-only.
-    Keeping edits one-sided avoids two people silently overwriting each other."""
-    back = _btn(i18n.get("btn_back", lang), f"list:{back_to}")
+    Keeping edits one-sided avoids two people silently overwriting each other.
+    Back goes to the person (or home, if this is their only debt)."""
+    back = _btn(i18n.get("btn_back", lang), f"pp:{debt_id}")
     if not is_mine:
         return InlineKeyboardMarkup(inline_keyboard=[[back]])
 
@@ -266,8 +323,15 @@ def settings_kb(lang, currency):
             _btn(i18n.get("btn_invite", lang), "invite"),
             _btn(i18n.get("btn_help", lang), "help"),
         ],
+        [_btn(i18n.get("btn_home", lang), "h:all:0")],
     ])
 
 
 def back_to_settings_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[[_btn(i18n.get("btn_back", lang), "settings")]])
+
+
+def with_home_button(markup, lang):
+    rows = list(markup.inline_keyboard) if markup else []
+    rows.append([_btn(i18n.get("btn_home", lang), "h:all:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

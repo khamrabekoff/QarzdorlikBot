@@ -6,7 +6,7 @@
   "menu_owe_me": "📥 Мне должны",
   "menu_i_owe": "📤 Я должен",
   "menu_settings": "⚙️ Настройки",
-  "home_title": "💰 <b>МОИ ДОЛГИ</b>",
+  "home_title": "💰 <b>Мои долги</b>",
   "home_owe_me": "📥 Мне должны",
   "home_i_owe": "📤 Я должен",
   "home_empty": "Пока долгов нет.\n\n<i>Добавьте через «➕ Новый долг».</i>",
@@ -156,5 +156,15 @@
   "cmd_start": "Главная",
   "cmd_new": "Новый долг",
   "cmd_help": "Помощь",
-  "cmd_cancel": "Отмена"
+  "cmd_cancel": "Отмена",
+  "menu_home": "📋 Мои долги",
+  "home_pick": "<i>Кого открыть? 👇</i>",
+  "home_filter_empty": "<i>В этом разделе никого нет.</i>",
+  "filter_all": "Все",
+  "btn_add_more": "➕ Ещё долг",
+  "btn_home": "🏠 Главная",
+  "person_net_lent": "Должен вам: <b>{totals}</b>",
+  "person_net_borrowed": "Вы должны: <b>{totals}</b>",
+  "add_ask_amount_for": "💵 <b>{name}</b> — сколько?\n\n<i>Например: 500000 или 500к</i>",
+  "menu_ready": "👇 Меню — внизу"
 }

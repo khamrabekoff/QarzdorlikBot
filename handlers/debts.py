@@ -20,6 +20,7 @@ import database as db
 import keyboards as kb
 import views
 from handlers.common import edit_or_send, notify_counterparty, user_display
+from handlers.start import render_home
 from keyboards import CURRENCIES
 from states import AddDebt, Edit, Pay
 from utils import (
@@ -59,22 +60,51 @@ async def start_add(message: types.Message, state: FSMContext):
 async def list_owe_me(message: types.Message, state: FSMContext):
     await state.clear()
     lang = await db.get_user_lang(message.from_user.id)
-    await _send_list(message.bot, message.from_user.id, "lent", lang)
+    await render_home(message.bot, message.from_user.id, lang, "in")
 
 
 @router.message(F.text.in_(i18n.all_variants("menu_i_owe")))
 async def list_i_owe(message: types.Message, state: FSMContext):
     await state.clear()
     lang = await db.get_user_lang(message.from_user.id)
-    await _send_list(message.bot, message.from_user.id, "borrowed", lang)
+    await render_home(message.bot, message.from_user.id, lang, "out")
 
 
 # ---------- add ----------
+
+@router.callback_query(F.data == "add")
+async def add_button(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    lang = await db.get_user_lang(callback.from_user.id)
+    await state.update_data(lang=lang)
+    await callback.answer()
+    await edit_or_send(callback, i18n.get("add_choose_type", lang), kb.type_kb(lang))
+
+
+@router.callback_query(F.data.startswith("padd:"))
+async def add_for_person(callback: types.CallbackQuery, state: FSMContext):
+    """'➕ Yana qarz' on a person's card: the name is already known."""
+    await state.clear()
+    lang = await db.get_user_lang(callback.from_user.id)
+    debt = await db.get_debt(_int(callback.data.split(":", 1)[1]) or 0)
+    if not debt or debt["user_id"] != callback.from_user.id:
+        await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
+        return
+    await state.update_data(lang=lang, preset_name=debt["person_name"])
+    await callback.answer()
+    await edit_or_send(callback, i18n.get("add_choose_type", lang), kb.type_kb(lang))
 
 @router.callback_query(F.data.startswith("type:"))
 async def picked_type(callback: types.CallbackQuery, state: FSMContext):
     debt_type = "borrowed" if callback.data.endswith("borrowed") else "lent"
     lang = await db.get_user_lang(callback.from_user.id)
+    preset = (await state.get_data()).get("preset_name")
+    if preset:
+        await state.update_data(debt_type=debt_type, lang=lang, person_name=preset)
+        await state.set_state(AddDebt.entering_amount)
+        await callback.answer()
+        await edit_or_send(callback, i18n.get("add_ask_amount_for", lang, name=esc(preset)), kb.cancel_kb(lang))
+        return
     names = await db.get_recent_names(callback.from_user.id)
     await state.update_data(debt_type=debt_type, lang=lang, recent_names=names)
     await state.set_state(AddDebt.entering_who_amount)
@@ -279,7 +309,8 @@ async def save_debt(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
     await edit_or_send(callback, views.saved_card(payload, lang),
-                       kb.saved_kb(debt_id, payload["person_name"], payload["debt_type"], lang))
+                       kb.with_home_button(kb.saved_kb(debt_id, payload["person_name"],
+                                                       payload["debt_type"], lang), lang))
 
 
 async def _stale(callback: types.CallbackQuery, state: FSMContext):
@@ -288,25 +319,55 @@ async def _stale(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer(i18n.get("stale_button", lang), show_alert=True)
 
 
-# ---------- lists ----------
-
-async def _send_list(bot: Bot, user_id, debt_type, lang, callback=None):
-    debts = await db.get_active_debts(user_id, debt_type)
-    text = views.debt_list_card(debts, debt_type, lang, max_items=kb.MAX_LIST)
-    markup = kb.debt_numbers_kb(debts, debt_type) if debts else None
-    if callback:
-        await edit_or_send(callback, text, markup)
-    else:
-        await bot.send_message(user_id, text, reply_markup=markup)
-
+# ---------- people ----------
 
 @router.callback_query(F.data.startswith("list:"))
 async def back_to_list(callback: types.CallbackQuery, state: FSMContext):
+    """Buttons from before v2.2 (and the 'list' button after closing)."""
     await state.clear()
-    debt_type = "borrowed" if callback.data.endswith("borrowed") else "lent"
+    flt = "out" if callback.data.endswith("borrowed") else "in"
     lang = await db.get_user_lang(callback.from_user.id)
     await callback.answer()
-    await _send_list(callback.bot, callback.from_user.id, debt_type, lang, callback=callback)
+    await render_home(callback.bot, callback.from_user.id, lang, flt, callback=callback)
+
+
+async def _person_of(uid, debt_id):
+    """Everyone's open debts with the same person as `debt_id`, as one group."""
+    debts = await db.get_active_debts(uid)
+    row = next((d for d in debts if d["id"] == debt_id), None)
+    if not row:
+        return None
+    key = views.person_key(row)
+    return views.group_people([d for d in debts if views.person_key(d) == key])[0]
+
+
+@router.callback_query(F.data.startswith("p:"))
+async def open_person(callback: types.CallbackQuery, state: FSMContext):
+    """A person on the home screen. With a single debt, skip straight to it."""
+    await state.clear()
+    lang = await db.get_user_lang(callback.from_user.id)
+    person = await _person_of(callback.from_user.id, _int(callback.data.split(":", 1)[1]))
+    await callback.answer()
+    if not person:
+        await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
+        return
+    if len(person["debts"]) == 1:
+        await _show_card(callback, person["debts"][0]["id"], lang)
+        return
+    await edit_or_send(callback, views.person_card(person, lang), kb.person_kb(person, lang))
+
+
+@router.callback_query(F.data.startswith("pp:"))
+async def back_to_person(callback: types.CallbackQuery, state: FSMContext):
+    """'Back' from a debt card: to the person, or home if that was their only debt."""
+    await state.clear()
+    lang = await db.get_user_lang(callback.from_user.id)
+    person = await _person_of(callback.from_user.id, _int(callback.data.split(":", 1)[1]))
+    await callback.answer()
+    if not person or len(person["debts"]) == 1:
+        await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
+        return
+    await edit_or_send(callback, views.person_card(person, lang), kb.person_kb(person, lang))
 
 
 # ---------- one debt ----------
@@ -430,7 +491,7 @@ async def do_delete(callback: types.CallbackQuery):
         await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
         return
     await callback.answer(i18n.get("debt_deleted", lang))
-    await _send_list(callback.bot, callback.from_user.id, debt["debt_type"], lang, callback=callback)
+    await render_home(callback.bot, callback.from_user.id, lang, callback=callback)
     await notify_counterparty(callback.bot, debt, "notify_deleted")
 
 
