@@ -158,3 +158,24 @@ def test_operator_endpoints_need_the_secret():
     client = bot_app.app.test_client()
     for path in ("/status/x", "/logs/x", "/deploy/x", "/setup/x", "/backup/x", "/cron/reminders/x"):
         assert client.get(path).status_code == 403, path
+
+
+async def test_long_proxy_outage_on_button_answer_does_not_abort():
+    """2026-10-13 12:02: the proxy was down longer than all retries and
+    open_person died on callback.answer(). That call only clears the spinner."""
+    from aiohttp_socks import ProxyError
+    method = AnswerCallbackQuery(callback_query_id="1")
+    err = ProxyError("503 Service Unavailable", error_code=503)
+    flaky = _Flaky(*[err] * bot_app.ResilientRequests.ATTEMPTS)
+    assert await bot_app.ResilientRequests()(flaky, None, method) is True
+
+
+async def test_connection_outage_does_not_alert_admin(ali, tg, monkeypatch):
+    from aiohttp_socks import ProxyError
+
+    async def down(*a, **k):
+        raise ProxyError("503 Service Unavailable", error_code=503)
+    monkeypatch.setattr(db, "get_active_debts", down)
+    tg.clear()
+    await ali.say("📋 Qarzlarim")
+    assert not [m for m in tg.sent("SendMessage") if m.chat_id == 999]

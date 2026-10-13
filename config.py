@@ -42,7 +42,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
 PA_API_TOKEN = os.getenv("PA_API_TOKEN", "")
 PA_USERNAME = os.getenv("PA_USERNAME", WEBHOOK_DOMAIN.split(".")[0])
 
-BOT_VERSION = "2.4.2"
+BOT_VERSION = "2.4.3"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set (.env)")

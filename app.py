@@ -93,7 +93,10 @@ class ResilientRequests(BaseRequestMiddleware):
     """Retry a Telegram call that failed on the way there, and don't let an
     unanswerable button press abort the rest of a handler."""
 
-    ATTEMPTS = 4  # the proxy's 503 bursts last a few seconds: 0.6+1.2+1.8 s of waiting
+    # Pauses between attempts. The proxy's 503 bursts were seen lasting
+    # 5+ seconds (2026-10-13 12:01-12:02): 0.6+1.2+1.8 s was not enough.
+    BACKOFF = (0.5, 1.0, 2.0, 3.0, 4.0)
+    ATTEMPTS = len(BACKOFF) + 1
 
     async def __call__(self, make_request, bot, method):
         for attempt in range(1, self.ATTEMPTS + 1):
@@ -111,10 +114,14 @@ class ResilientRequests(BaseRequestMiddleware):
                 await asyncio.sleep(e.retry_after)
             except _NETWORK_ERRORS as e:
                 if attempt == self.ATTEMPTS:
+                    if isinstance(method, AnswerCallbackQuery):
+                        # Only clears the button's spinner - never worth
+                        # aborting the screen the user actually asked for.
+                        return True
                     raise
                 logger.info("Telegram call %s failed (%s), retry %d",
                             type(method).__name__, type(e).__name__, attempt)
-                await asyncio.sleep(0.6 * attempt)
+                await asyncio.sleep(self.BACKOFF[attempt - 1])
 
 
 session = None
@@ -148,13 +155,18 @@ async def track_activity(handler, event, data):
 @dp.errors()
 async def on_error(event: ErrorEvent, bot: Bot):
     exc = event.exception
+    network = isinstance(exc, _NETWORK_ERRORS)
     logger.error("Update %s failed: %s: %s", event.update.update_id,
-                 type(exc).__name__, exc, exc_info=exc)
-    await ops.alert_admin(
-        bot,
-        f"⚠️ <b>Xatolik</b> (v{BOT_VERSION})\n<code>{esc(type(exc).__name__)}: {esc(str(exc))[:400]}</code>",
-        key=f"error:{type(exc).__name__}", every_seconds=600,
-    )
+                 type(exc).__name__, exc, exc_info=None if network else exc)
+    if not network:
+        # Connection outages aren't alerted: the alert itself can't get out
+        # while the proxy is down and is stale noise once it's back. Long
+        # outages still surface through the "cron didn't run" check.
+        await ops.alert_admin(
+            bot,
+            f"⚠️ <b>Xatolik</b> (v{BOT_VERSION})\n<code>{esc(type(exc).__name__)}: {esc(str(exc))[:400]}</code>",
+            key=f"error:{type(exc).__name__}", every_seconds=600,
+        )
 
     # Tell the person something went wrong instead of leaving them waiting.
     upd = event.update
