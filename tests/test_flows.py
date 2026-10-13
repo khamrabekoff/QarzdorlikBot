@@ -278,14 +278,31 @@ async def test_broadcast_asks_before_sending(bot, tg, ali):
     admin = Chatter(bot, uid=999, first_name="Boss", username="boss")
     await admin.register()
     await admin.say("/broadcast")
-    tg.clear()
     await admin.say("Hammaga salom")
+    tg.clear()
+    await admin.tap("abcast_skip")              # no Russian version: Uzbek to all
     # Only the preview to the admin so far - nobody else got anything.
     assert [m.chat_id for m in tg.sent("CopyMessage")] == [999]
     assert "abcast_go" in tg.buttons()
     tg.clear()
     await admin.tap("abcast_go")
     assert sorted(m.chat_id for m in tg.sent("CopyMessage")) == [1, 999]
+
+
+async def test_broadcast_sends_each_user_their_language(bot, tg, ali):
+    vali = Chatter(bot, uid=2, first_name="Vali")
+    await vali.register(lang="ru")
+    admin = Chatter(bot, uid=999, first_name="Boss", username="boss")
+    await admin.register()
+    await admin.say("/broadcast")
+    await admin.say("Salom")                    # the Uzbek version
+    await admin.say("Привет")
+    tg.clear()
+    await admin.tap("abcast_go")
+    copies = {m.chat_id: m.message_id for m in tg.sent("CopyMessage")}
+    assert set(copies) == {1, 2, 999}
+    assert copies[1] == copies[999]             # both Uzbek users got the same source
+    assert copies[2] != copies[1]               # the Russian user got the other one
 
 
 async def test_non_admin_cannot_use_admin_commands(ali, tg):

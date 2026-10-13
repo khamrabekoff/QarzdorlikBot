@@ -192,6 +192,13 @@ async def count_users() -> int:
             return (await cur.fetchone())[0]
 
 
+async def get_user_ids_with_lang():
+    """[(user_id, language)] - for sending each person their language."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, language FROM users") as cur:
+            return [(r[0], r[1]) for r in await cur.fetchall()]
+
+
 async def get_all_user_ids() -> List[int]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row

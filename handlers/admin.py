@@ -138,11 +138,20 @@ async def do_direct(message: types.Message, state: FSMContext, bot: Bot):
 
 
 # ---------- broadcast ----------
+# Two versions, one per language: each user gets the one matching the
+# language they picked in the bot. Russian is optional - skip it and
+# everyone gets the Uzbek one.
+
+def _kb(*buttons):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=t, callback_data=d) for t, d in buttons]])
+
 
 async def _start_broadcast(message: types.Message, state: FSMContext):
     await state.set_state(Admin.broadcast)
     await message.answer(
-        "📢 Hammaga yuboriladigan xabarni yozing (matn, rasm yoki ovozli xabar).\n\n"
+        "📢 <b>Hammaga xabar</b>\n\n"
+        "1/2 · 🇺🇿 <b>O'zbekcha</b> variantini yuboring (matn, rasm yoki ovozli xabar).\n\n"
         "<i>Yuborishdan oldin ko'rib chiqasiz. Bekor qilish: /cancel</i>"
     )
 
@@ -161,24 +170,58 @@ async def broadcast_button(callback: types.CallbackQuery, state: FSMContext):
 
 
 @router.message(Admin.broadcast)
-async def preview_broadcast(message: types.Message, state: FSMContext, bot: Bot):
-    """Show exactly what people will receive, and ask before sending - the
-    old version went out to everyone the moment the text was typed."""
+async def got_broadcast_uz(message: types.Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         await state.clear()
         return
-    total = len(await db.get_all_user_ids())
-    await state.set_state(Admin.broadcast_confirm)
-    await state.update_data(src_chat=message.chat.id, src_msg=message.message_id)
-    await message.answer("👇 Foydalanuvchilar shunday ko'radi:")
-    await bot.copy_message(message.chat.id, message.chat.id, message.message_id)
+    await state.update_data(src_chat=message.chat.id, src_uz=message.message_id, src_ru=None)
+    await state.set_state(Admin.broadcast_ru)
     await message.answer(
-        f"Yuborilsinmi? Qabul qiluvchilar: <b>{total}</b> ta",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Yuborish", callback_data="abcast_go"),
-            InlineKeyboardButton(text="❌ Bekor", callback_data="cancel"),
-        ]]),
+        "2/2 · 🇷🇺 Endi <b>ruscha</b> variantini yuboring.\n\n"
+        "<i>Rus tilini tanlaganlar shuni oladi.</i>",
+        reply_markup=_kb(("⏭ O'tkazib yuborish — hammaga o'zbekcha", "abcast_skip")),
     )
+
+
+@router.message(Admin.broadcast_ru)
+async def got_broadcast_ru(message: types.Message, state: FSMContext, bot: Bot):
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+    await state.update_data(src_ru=message.message_id)
+    await _preview(message.chat.id, state, bot)
+
+
+@router.callback_query(F.data == "abcast_skip", Admin.broadcast_ru)
+async def skip_broadcast_ru(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    await callback.answer()
+    if _is_admin(callback.from_user.id):
+        await _preview(callback.message.chat.id, state, bot)
+
+
+def _split_by_lang(users):
+    """[(id, lang)] -> (uzbek_ids, russian_ids); unknown language counts as Uzbek."""
+    ru = [uid for uid, lang in users if lang == "ru"]
+    uz = [uid for uid, lang in users if lang != "ru"]
+    return uz, ru
+
+
+async def _preview(chat_id, state: FSMContext, bot: Bot):
+    """Show exactly what each group will receive, and ask before sending."""
+    data = await state.get_data()
+    uz, ru = _split_by_lang(await db.get_user_ids_with_lang())
+    await state.set_state(Admin.broadcast_confirm)
+
+    if data.get("src_ru"):
+        await bot.send_message(chat_id, f"👇 🇺🇿 O'zbekcha — <b>{len(uz)}</b> kishi:")
+        await bot.copy_message(chat_id, data["src_chat"], data["src_uz"])
+        await bot.send_message(chat_id, f"👇 🇷🇺 Ruscha — <b>{len(ru)}</b> kishi:")
+        await bot.copy_message(chat_id, data["src_chat"], data["src_ru"])
+    else:
+        await bot.send_message(chat_id, f"👇 Hammaga (<b>{len(uz) + len(ru)}</b> kishi) shu boradi:")
+        await bot.copy_message(chat_id, data["src_chat"], data["src_uz"])
+    await bot.send_message(chat_id, "Yuborilsinmi?",
+                           reply_markup=_kb(("✅ Yuborish", "abcast_go"), ("❌ Bekor", "cancel")))
 
 
 @router.callback_query(F.data == "abcast_go", Admin.broadcast_confirm)
@@ -191,11 +234,13 @@ async def do_broadcast(callback: types.CallbackQuery, state: FSMContext, bot: Bo
     await callback.answer()
     await callback.message.edit_text("⏳ Yuborilmoqda…")
 
-    user_ids = await db.get_all_user_ids()
+    uz, ru = _split_by_lang(await db.get_user_ids_with_lang())
+    src_ru = data.get("src_ru") or data["src_uz"]
+    plan = [(uid, data["src_uz"]) for uid in uz] + [(uid, src_ru) for uid in ru]
     sent = 0
-    for uid in user_ids:
+    for uid, src in plan:
         try:
-            await bot.copy_message(uid, data["src_chat"], data["src_msg"])
+            await bot.copy_message(uid, data["src_chat"], src)
             sent += 1
         except Exception as e:  # noqa: BLE001 - one blocked chat must not stop the rest
             logger.info("Broadcast skipped %s: %s", uid, e)
@@ -203,6 +248,7 @@ async def do_broadcast(callback: types.CallbackQuery, state: FSMContext, bot: Bo
         await asyncio.sleep(0.05)
 
     await callback.message.edit_text(
-        f"✅ {sent}/{len(user_ids)} ta foydalanuvchiga yuborildi."
-        + (f"\n<i>{len(user_ids) - sent} tasi botni bloklagan.</i>" if sent < len(user_ids) else "")
+        f"✅ {sent}/{len(plan)} ta foydalanuvchiga yuborildi "
+        f"(🇺🇿 {len(uz)} · 🇷🇺 {len(ru)})."
+        + (f"\n<i>{len(plan) - sent} tasi botni bloklagan.</i>" if sent < len(plan) else "")
     )
