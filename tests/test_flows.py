@@ -251,3 +251,41 @@ async def test_export_neutralises_spreadsheet_formulas(ali, tg):
     await ali.tap("export")
     data = tg.sent("SendDocument")[0].document.data.decode("utf-8")
     assert "'=HYPERLINK" in data and ";=HYPERLINK" not in data
+
+
+# ---------- admin ----------
+
+async def test_admin_users_list_and_direct_message(bot, tg, ali):
+    admin = Chatter(bot, uid=999, first_name="Boss", username="boss")
+    await admin.register()
+    await admin.say("/users")
+    assert "Foydalanuvchilar: 2" in tg.last_text() and "@ali" in tg.last_text()
+    assert "amsg:1" in tg.buttons() and "amsg:999" not in tg.buttons()
+
+    await admin.tap("amsg:1")
+    tg.clear()
+    await admin.say("Salom, yangi versiya chiqdi!")
+    [copy] = tg.sent("CopyMessage")
+    assert copy.chat_id == 1 and copy.from_chat_id == 999
+
+
+async def test_broadcast_asks_before_sending(bot, tg, ali):
+    admin = Chatter(bot, uid=999, first_name="Boss", username="boss")
+    await admin.register()
+    await admin.say("/broadcast")
+    tg.clear()
+    await admin.say("Hammaga salom")
+    # Only the preview to the admin so far - nobody else got anything.
+    assert [m.chat_id for m in tg.sent("CopyMessage")] == [999]
+    assert "abcast_go" in tg.buttons()
+    tg.clear()
+    await admin.tap("abcast_go")
+    assert sorted(m.chat_id for m in tg.sent("CopyMessage")) == [1, 999]
+
+
+async def test_non_admin_cannot_use_admin_commands(ali, tg):
+    tg.clear()
+    await ali.say("/users")
+    await ali.tap("amsg:1")
+    assert not any("Foydalanuvchilar" in t for t in tg.texts())
+    assert tg.sent("CopyMessage") == []

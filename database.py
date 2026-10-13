@@ -171,6 +171,27 @@ async def get_default_currency(user_id: int, fallback: str) -> str:
     return row["currency"] if row and row["currency"] else fallback
 
 
+async def get_users_overview(limit: int = 30):
+    """Admin list: who uses the bot, most recently active first."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT u.id, u.username, u.first_name, u.language, u.joined_at, u.last_active, u.source,
+                   (SELECT COUNT(*) FROM debts d WHERE d.user_id = u.id AND d.status = 'active') AS active,
+                   (SELECT COUNT(*) FROM debts d WHERE d.user_id = u.id) AS total
+            FROM users u
+            ORDER BY COALESCE(u.last_active, u.joined_at) DESC
+            LIMIT ?
+        """, (limit,)) as cur:
+            return await cur.fetchall()
+
+
+async def count_users() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            return (await cur.fetchone())[0]
+
+
 async def get_all_user_ids() -> List[int]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row

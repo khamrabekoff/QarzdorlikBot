@@ -38,7 +38,7 @@ from aiogram.exceptions import (
     TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError,
 )
 from aiogram.methods import AnswerCallbackQuery
-from aiogram.types import BotCommand, ErrorEvent, Update
+from aiogram.types import BotCommand, BotCommandScopeChat, ErrorEvent, Update
 from flask import Flask, jsonify, request
 
 try:  # aiogram >= 3.7
@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 import database as db
 import ops
 from config import (
-    BOT_TOKEN, BOT_VERSION, CRON_SECRET, DB_PATH, DEPLOY_SECRET,
+    ADMIN_ID, BOT_TOKEN, BOT_VERSION, CRON_SECRET, DB_PATH, DEPLOY_SECRET,
     PROXY_URL, WEBHOOK_DOMAIN, WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_URL,
 )
 from fsm_storage import SQLiteStorage, purge_expired_states
@@ -211,6 +211,16 @@ async def ensure_commands():
             for c in ("start", "new", "help", "cancel")
         ]
         await bot.set_my_commands(commands, language_code=code)
+    if ADMIN_ID:
+        # Only the admin's own chat sees these in the "/" menu.
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Bosh sahifa"),
+             BotCommand(command="users", description="Foydalanuvchilar va xabar yozish"),
+             BotCommand(command="broadcast", description="Hammaga xabar"),
+             BotCommand(command="stats", description="Statistika"),
+             BotCommand(command="backup", description="Bazaning zaxira nusxasi")],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
     await db.meta_set("commands_version", BOT_VERSION)
 
 

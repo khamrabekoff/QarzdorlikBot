@@ -28,3 +28,5 @@ class Edit(StatesGroup):
 
 class Admin(StatesGroup):
     broadcast = State()
+    broadcast_confirm = State()
+    direct = State()
