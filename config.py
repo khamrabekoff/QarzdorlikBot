@@ -1,4 +1,5 @@
 """Deployment configuration, read from the environment (.env on the server)."""
+import hashlib
 import os
 
 from dotenv import load_dotenv
@@ -17,6 +18,12 @@ WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN", "khamrabekoff.pythonanywhere.com")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", f"https://{WEBHOOK_DOMAIN}{WEBHOOK_PATH}")
 
+# Telegram echoes this in the X-Telegram-Bot-Api-Secret-Token header of every
+# webhook call. Without checking it, anyone who guessed /webhook could post a
+# forged update "from" any user and, say, delete their debts. Derived from the
+# bot token so there is no extra secret to manage.
+WEBHOOK_SECRET = hashlib.sha256(f"webhook:{os.getenv('BOT_TOKEN', '')}".encode()).hexdigest()[:48]
+
 # Secrets guarding the operator endpoints (deploy / status / logs / cron).
 DEPLOY_SECRET = os.getenv("DEPLOY_SECRET", "")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
@@ -29,7 +36,13 @@ PROXY_URL = "http://proxy.server:3128" if ON_PYTHONANYWHERE else None
 
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
 
-BOT_VERSION = "2.0"
+# Optional: lets the bot renew its own scheduled task before the free tier
+# expires it, and warn about the web app's expiry. Without it those checks
+# are skipped and only the "cron didn't run" alert remains.
+PA_API_TOKEN = os.getenv("PA_API_TOKEN", "")
+PA_USERNAME = os.getenv("PA_USERNAME", WEBHOOK_DOMAIN.split(".")[0])
+
+BOT_VERSION = "2.1"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set (.env)")

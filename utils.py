@@ -1,4 +1,6 @@
 """Translations, formatting, and date parsing."""
+import calendar
+import html
 import json
 import logging
 import os
@@ -12,9 +14,61 @@ logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(TIMEZONE)
 
+# Anything above this is a typo (an extra zero row), not a debt. It also keeps
+# float precision and Telegram's message length out of trouble.
+MAX_AMOUNT = 10 ** 13
+MAX_NAME_LEN = 40
+MAX_NOTE_LEN = 200
+
+
+def esc(text) -> str:
+    """Escape user-supplied text for HTML parse mode.
+
+    Every message goes out with parse_mode=HTML, so a name like "<Ali>" or
+    "A&B" used to make Telegram reject the whole message - the user tapped a
+    button and got silence."""
+    return html.escape(str(text if text is not None else ""), quote=False)
+
+
+def clean_name(text):
+    """Collapse whitespace; None when empty or too long to be a name."""
+    name = " ".join((text or "").split())
+    if not name or len(name) > MAX_NAME_LEN:
+        return None
+    return name
+
+
+def lang_from_code(language_code) -> str:
+    """Telegram's client language -> our locale. Russian-speaking clients get
+    Russian; everyone else gets Uzbek, the bot's home language."""
+    code = (language_code or "").lower()
+    return "ru" if code.startswith(("ru", "be", "kk", "uk")) else "uz"
+
+
+def display_name(username=None, first_name=None) -> str:
+    if username:
+        return "@" + username
+    return first_name or "?"
+
 
 def now_local() -> datetime:
     return datetime.now(TZ).replace(tzinfo=None)
+
+
+def utc_to_local(ts):
+    """SQLite's CURRENT_TIMESTAMP is UTC; everything user-facing is Tashkent
+    time. Comparing the two raw put 'created 30 minutes ago' five hours off."""
+    try:
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ).replace(tzinfo=None)
+
+
+def fmt_ts(ts) -> str:
+    """Stored UTC timestamp -> local DD.MM.YYYY."""
+    local = utc_to_local(ts)
+    return local.strftime("%d.%m.%Y") if local else ""
 
 
 class I18n:
@@ -58,6 +112,15 @@ def fmt_amount(val) -> str:
     if abs(val - round(val)) < 0.005:
         return f"{int(round(val)):,}".replace(",", " ")
     return f"{val:,.2f}".replace(",", " ")
+
+
+def fmt_paid_csv(val) -> str:
+    """Number for a spreadsheet cell: no thousands spaces (Excel would read
+    text), comma decimals (the uz/ru Excel convention)."""
+    val = float(val or 0)
+    if abs(val - round(val)) < 0.005:
+        return str(int(round(val)))
+    return f"{val:.2f}".replace(".", ",")
 
 
 def fmt_date(iso_str) -> str:
@@ -105,7 +168,32 @@ def parse_amount(text):
         value = float(t) * multiplier
     except ValueError:
         return None
-    return value if value > 0 else None
+    return value if 0 < value <= MAX_AMOUNT else None
+
+
+_AMOUNT_WORD = re.compile(r"^(mln|млн|million|m|м|ming|тыс|k|к|so'?m|сум|\$|€|₽)$", re.I)
+
+
+def split_name_amount(text):
+    """'Ali aka 500k' -> ('Ali aka', 500000.0). Either part may be None.
+
+    The name is everything before the first token with a digit in it, so
+    two-word names survive; the old split took only the first word as the
+    name and fed 'aka 500k' to the amount parser."""
+    tokens = (text or "").split()
+    first_digit = next((i for i, tok in enumerate(tokens) if re.search(r"\d", tok)), None)
+    if first_digit is None:
+        return clean_name(text), None
+
+    if first_digit == 0:
+        # "500000 Ali": amount first. The amount runs while tokens are digits
+        # or multiplier words ("1,5 mln Ali").
+        end = 1
+        while end < len(tokens) and (re.search(r"\d", tokens[end]) or _AMOUNT_WORD.match(tokens[end])):
+            end += 1
+        return clean_name(" ".join(tokens[end:])), parse_amount(" ".join(tokens[:end]))
+
+    return clean_name(" ".join(tokens[:first_digit])), parse_amount(" ".join(tokens[first_digit:]))
 
 
 def parse_date(text):
@@ -152,10 +240,29 @@ def shift_date(days=0, weeks=0, months=0, end_of="") -> str:
         ahead = 6 - today.weekday() or 7
         return (today + timedelta(days=ahead)).isoformat()
     if end_of == "month":
-        import calendar
         last = calendar.monthrange(today.year, today.month)[1]
         if today.day < last:
             return date(today.year, today.month, last).isoformat()
         y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
         return date(y, m, calendar.monthrange(y, m)[1]).isoformat()
     return (today + timedelta(days=days, weeks=weeks) + timedelta(days=30 * months)).isoformat()
+
+
+# Codes carried in the date buttons' callback data -> due date. 'none' is an
+# open-ended debt; anything unrecognised (a button from an older version)
+# falls back to a week rather than failing.
+_DATE_CHOICES = {
+    "t1": lambda: shift_date(days=1),
+    "d3": lambda: shift_date(days=3),
+    "w1": lambda: shift_date(weeks=1),
+    "d10": lambda: shift_date(days=10),
+    "m1": lambda: shift_date(months=1),
+    "ew": lambda: shift_date(end_of="week"),  # no longer offered; old buttons still send it
+    "em": lambda: shift_date(end_of="month"),
+}
+
+
+def resolve_date_choice(code):
+    if code == "none":
+        return None
+    return _DATE_CHOICES.get(code, _DATE_CHOICES["w1"])()

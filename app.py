@@ -1,31 +1,44 @@
 """Flask entry point for the debts bot (webhook mode).
 
-Two things about the previous version are worth knowing, because both made
-the bot look broken to users:
+Things about earlier versions worth knowing, because each made the bot look
+broken to users:
 
 1. It started an AsyncIOScheduler bound to `worker_loop` and expected a job
    to fire every 5 minutes. But that loop only runs *inside*
    run_until_complete(), i.e. only while a webhook request is being handled -
-   between requests it is idle, so the timer never fired. Reminders, the whole
-   point of a debt bot, effectively did not work. Scheduling now comes from
-   outside: a PythonAnywhere task (or any cron) hits /cron/reminders, and
-   ordinary bot traffic also triggers a throttled sweep as a fallback.
+   between requests it is idle, so the timer never fired. Scheduling now
+   comes from outside: a PythonAnywhere task (or any cron) hits
+   /cron/reminders, and ordinary bot traffic also triggers a throttled sweep.
 
 2. Conversation state lived in aiogram's MemoryStorage. PythonAnywhere
    recycles the worker constantly, so anyone midway through adding a debt
    silently lost their progress. State now lives in SQLite (fsm_storage.py).
+
+3. Any exception made the webhook answer 500, and Telegram re-delivers a
+   failed update - so one stale button press ("query is too old") was
+   replayed 8 times over two minutes on 2026-10-12, re-running the handler
+   each time. Errors are now handled inside the dispatcher (logged, admin
+   alerted, user told) and the webhook always acknowledges. Transient proxy
+   failures (PythonAnywhere's proxy returns 503 now and then) are retried
+   per request instead, where a retry can't duplicate a database write.
 """
 import asyncio
+import hmac
 import logging
 import os
 import subprocess
-import tempfile
 import threading
 import time
 from datetime import datetime
 
+import aiohttp
 from aiogram import Bot, Dispatcher
-from aiogram.types import Update
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError,
+)
+from aiogram.methods import AnswerCallbackQuery
+from aiogram.types import BotCommand, ErrorEvent, Update
 from flask import Flask, jsonify, request
 
 try:  # aiogram >= 3.7
@@ -33,13 +46,21 @@ try:  # aiogram >= 3.7
 except ImportError:  # older 3.x took parse_mode directly
     DefaultBotProperties = None
 
+try:  # what aiohttp-socks raises when PythonAnywhere's proxy says 503
+    from python_socks import ProxyError
+except ImportError:  # pragma: no cover
+    class ProxyError(Exception):
+        pass
+
 import database as db
+import ops
 from config import (
     BOT_TOKEN, BOT_VERSION, CRON_SECRET, DB_PATH, DEPLOY_SECRET,
-    PROXY_URL, WEBHOOK_DOMAIN, WEBHOOK_PATH,
+    PROXY_URL, WEBHOOK_DOMAIN, WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_URL,
 )
 from fsm_storage import SQLiteStorage, purge_expired_states
 from reminders import sweep_reminders
+from utils import esc, i18n
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -47,7 +68,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ---------- bot ----------
+
+_NETWORK_ERRORS = (
+    TelegramNetworkError, TelegramServerError, aiohttp.ClientError,
+    asyncio.TimeoutError, ConnectionError, ProxyError,
+)
+
+
+class ResilientRequests(BaseRequestMiddleware):
+    """Retry a Telegram call that failed on the way there, and don't let an
+    unanswerable button press abort the rest of a handler."""
+
+    ATTEMPTS = 3
+
+    async def __call__(self, make_request, bot, method):
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                return await make_request(bot, method)
+            except TelegramBadRequest:
+                if isinstance(method, AnswerCallbackQuery):
+                    # 'query is too old': the spinner can no longer be
+                    # cleared, but the card edit that follows still works.
+                    return True
+                raise
+            except TelegramRetryAfter as e:
+                if attempt == self.ATTEMPTS or e.retry_after > 5:
+                    raise
+                await asyncio.sleep(e.retry_after)
+            except _NETWORK_ERRORS as e:
+                if attempt == self.ATTEMPTS:
+                    raise
+                logger.info("Telegram call %s failed (%s), retry %d",
+                            type(method).__name__, type(e).__name__, attempt)
+                await asyncio.sleep(0.6 * attempt)
+
 
 session = None
 if PROXY_URL:
@@ -59,31 +115,62 @@ if DefaultBotProperties is not None:
               default=DefaultBotProperties(parse_mode="HTML"))
 else:
     bot = Bot(token=BOT_TOKEN, session=session, parse_mode="HTML")
+bot.session.middleware(ResilientRequests())
+
 dp = Dispatcher(storage=SQLiteStorage(DB_PATH))
 
 
 @dp.update.outer_middleware()
 async def track_activity(handler, event, data):
-    """Stamp last_active so retention can be measured. Done as middleware so
-    no handler has to remember to do it."""
+    """Stamp last_active (retention) and the current display name (so the
+    other side of a shared debt sees a name, not '?')."""
     user = data.get("event_from_user")
     if user:
         try:
-            await db.touch_user(user.id)
+            await db.touch_user(user.id, user.username, user.first_name)
         except Exception as e:  # noqa: BLE001 - never block an update over analytics
             logger.debug("touch_user failed: %s", e)
     return await handler(event, data)
 
-from handlers import admin, debts, sharing, start  # noqa: E402  (routers need `bot` above)
+
+@dp.errors()
+async def on_error(event: ErrorEvent, bot: Bot):
+    exc = event.exception
+    logger.error("Update %s failed: %s: %s", event.update.update_id,
+                 type(exc).__name__, exc, exc_info=exc)
+    await ops.alert_admin(
+        bot,
+        f"⚠️ <b>Xatolik</b> (v{BOT_VERSION})\n<code>{esc(type(exc).__name__)}: {esc(str(exc))[:400]}</code>",
+        key=f"error:{type(exc).__name__}", every_seconds=600,
+    )
+
+    # Tell the person something went wrong instead of leaving them waiting.
+    upd = event.update
+    who = (upd.message and upd.message.from_user) or (upd.callback_query and upd.callback_query.from_user)
+    if who:
+        try:
+            lang = await db.get_user_lang(who.id)
+            await bot.send_message(who.id, i18n.get("err_generic", lang))
+        except Exception:  # noqa: BLE001 - the failure may be Telegram itself
+            pass
+    return True
+
+
+from handlers import admin, debts, fallback, sharing, start  # noqa: E402  (routers need `bot` above)
 
 # sharing first: it claims /start with a deep-link payload, which the plain
-# /start handler in `start` would otherwise swallow.
+# /start handler in `start` would otherwise swallow. fallback last: it takes
+# whatever nobody else did.
 dp.include_router(sharing.router)
 dp.include_router(start.router)
 dp.include_router(debts.router)
 dp.include_router(admin.router)
+dp.include_router(fallback.router)
 
 app = Flask(__name__)
+# A Telegram update is a few KB; refuse anything absurd before parsing it.
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
 
 # ---------- async runtime ----------
 # One event loop for the worker's lifetime, driven from the request thread.
@@ -93,7 +180,7 @@ app = Flask(__name__)
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 _loop_lock = threading.Lock()
-_stats = {"updates": 0, "errors": 0, "last_ms": None, "reminder_sweeps": 0}
+_stats = {"updates": 0, "errors": 0, "rejected": 0, "last_ms": None, "reminder_sweeps": 0}
 
 
 def run_sync(coro, timeout=40):
@@ -105,6 +192,40 @@ try:
     run_sync(db.init_db(), timeout=60)
 except Exception as e:  # noqa: BLE001 - must not stop the app from serving
     logger.error("Database init failed: %s", e, exc_info=True)
+
+
+def _secret_ok(given, expected) -> bool:
+    """Constant-time comparison, and an unset secret never matches."""
+    return bool(expected) and hmac.compare_digest(str(given or ""), expected)
+
+
+# ---------- housekeeping ----------
+
+async def ensure_commands():
+    """The '/' menu in Telegram, per language. Re-sent once per version."""
+    if await db.meta_get("commands_version") == BOT_VERSION:
+        return
+    for lang, code in (("uz", None), ("ru", "ru")):
+        commands = [
+            BotCommand(command=c, description=i18n.get(f"cmd_{c}", lang))
+            for c in ("start", "new", "help", "cancel")
+        ]
+        await bot.set_my_commands(commands, language_code=code)
+    await db.meta_set("commands_version", BOT_VERSION)
+
+
+async def _housekeeping(from_cron: bool):
+    if from_cron:
+        await ops.record_cron_run()
+        await purge_expired_states(DB_PATH)
+        await ops.daily_backup(bot)
+    else:
+        await ops.check_cron_alive(bot)
+    await ops.keep_host_alive(bot)
+    try:
+        await ensure_commands()
+    except Exception as e:  # noqa: BLE001
+        logger.info("set_my_commands skipped: %s", e)
 
 
 # ---------- webhook ----------
@@ -125,12 +246,17 @@ def _maybe_sweep_reminders():
         _stats["reminder_sweeps"] += 1
         if sent:
             logger.info("Traffic-triggered reminder sweep sent %d", sent)
+        run_sync(_housekeeping(from_cron=False), timeout=60)
     except Exception as e:  # noqa: BLE001
         logger.warning("Reminder sweep skipped: %s", e)
 
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
+    if not _secret_ok(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), WEBHOOK_SECRET):
+        _stats["rejected"] += 1
+        return "Forbidden", 403
+
     started = datetime.now()
     try:
         # Deliberately not logging the update body: it carries phone numbers
@@ -140,9 +266,11 @@ def webhook():
         _stats["updates"] += 1
         _stats["last_ms"] = int((datetime.now() - started).total_seconds() * 1000)
     except Exception as e:  # noqa: BLE001
+        # Errors inside handlers are caught by on_error; reaching here means
+        # an unparseable update or a timeout. Acknowledge anyway: a replay
+        # would fail the same way, and could repeat a write that succeeded.
         _stats["errors"] += 1
         logger.error("Webhook error: %s: %s", type(e).__name__, e, exc_info=True)
-        return "Error", 500
 
     _maybe_sweep_reminders()
     return "OK", 200
@@ -152,15 +280,17 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "bot": "running"}), 200
+    return jsonify({"status": "ok", "bot": "running", "version": BOT_VERSION}), 200
 
 
 @app.route("/status/<secret>", methods=["GET"])
 def status(secret):
-    if not DEPLOY_SECRET or secret != DEPLOY_SECRET:
+    if not _secret_ok(secret, DEPLOY_SECRET):
         return "Forbidden", 403
     try:
         stats = run_sync(db.get_stats(), timeout=20)
+        stats["last_cron_at"] = run_sync(db.meta_get("last_cron_at"), timeout=10)
+        stats["last_backup_date"] = run_sync(db.meta_get("last_backup_date"), timeout=10)
     except Exception as e:  # noqa: BLE001
         stats = {"error": str(e)}
     return jsonify({
@@ -174,12 +304,16 @@ def status(secret):
 
 @app.route("/logs/<secret>", methods=["GET"])
 def logs(secret):
-    if not DEPLOY_SECRET or secret != DEPLOY_SECRET:
+    if not _secret_ok(secret, DEPLOY_SECRET):
         return "Forbidden", 403
     path = f"/var/log/{WEBHOOK_DOMAIN}.error.log"
     try:
+        n = max(1, min(int(request.args.get("n", 60)), 2000))
+    except ValueError:
+        n = 60
+    try:
         with open(path, "r", errors="replace") as fh:
-            tail = fh.readlines()[-int(request.args.get("n", 60)):]
+            tail = fh.readlines()[-n:]
         return "".join(tail), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:  # noqa: BLE001
         return f"Could not read {path}: {e}", 500, {"Content-Type": "text/plain"}
@@ -187,7 +321,7 @@ def logs(secret):
 
 @app.route("/deploy/<secret>", methods=["GET", "POST"])
 def deploy(secret):
-    if not DEPLOY_SECRET or secret != DEPLOY_SECRET:
+    if not _secret_ok(secret, DEPLOY_SECRET):
         return "Forbidden", 403
     try:
         repo_dir = os.path.dirname(os.path.abspath(__file__))
@@ -207,16 +341,38 @@ def deploy(secret):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route("/setup/<secret>", methods=["GET", "POST"])
+def setup(secret):
+    """Point Telegram at this webhook WITH the secret header, and refresh
+    the command menu. Run once after a deploy that changes either."""
+    if not _secret_ok(secret, DEPLOY_SECRET):
+        return "Forbidden", 403
+    try:
+        run_sync(bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
+                                 allowed_updates=["message", "callback_query"]), timeout=30)
+        run_sync(db.meta_set("commands_version", ""), timeout=10)
+        run_sync(ensure_commands(), timeout=30)
+        info = run_sync(bot.get_webhook_info(), timeout=30)
+        return jsonify({"status": "ok", "webhook": info.url,
+                        "pending": info.pending_update_count,
+                        "last_error": info.last_error_message}), 200
+    except Exception as e:  # noqa: BLE001
+        logger.error("Setup failed: %s", e, exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route("/cron/reminders/<secret>", methods=["GET", "POST"])
 def cron_reminders(secret):
-    """Scheduled sweep. ?dry=1 reports who would be notified, sending nothing -
-    always use it when testing, these go to real people."""
-    if not CRON_SECRET or secret != CRON_SECRET:
+    """Scheduled sweep, plus the daily chores. ?dry=1 reports who would be
+    notified and does nothing else - always use it when testing, these go to
+    real people."""
+    if not _secret_ok(secret, CRON_SECRET):
         return "Forbidden", 403
     dry = request.args.get("dry") in ("1", "true", "yes")
     try:
         result = run_sync(sweep_reminders(bot, dry_run=dry), timeout=120)
-        run_sync(purge_expired_states(DB_PATH), timeout=30)
+        if not dry:
+            run_sync(_housekeeping(from_cron=True), timeout=120)
         key = "would_notify" if dry else "sent"
         return jsonify({"status": "ok", "dry_run": dry, key: result}), 200
     except Exception as e:  # noqa: BLE001
@@ -226,38 +382,15 @@ def cron_reminders(secret):
 
 @app.route("/backup/<secret>", methods=["GET", "POST"])
 def backup(secret):
-    """Send the database to the admin as a Telegram document - the only
-    off-site copy this free-tier host has."""
-    if not DEPLOY_SECRET or secret != DEPLOY_SECRET:
+    """Send the database to the admin as a Telegram document."""
+    if not _secret_ok(secret, DEPLOY_SECRET):
         return "Forbidden", 403
-    from config import ADMIN_ID
-    if not ADMIN_ID:
-        return jsonify({"status": "error", "message": "ADMIN_ID not set"}), 400
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    tmp = os.path.join(tempfile.gettempdir(), f"qarzdorlik_{stamp}.db")
     try:
-        run_sync(db.backup_to(tmp), timeout=60)
-        stats = run_sync(db.get_stats(), timeout=20)
-        size_kb = os.path.getsize(tmp) / 1024
-
-        from aiogram.types import FSInputFile
-        caption = (
-            f"💾 <b>Zaxira nusxa</b>\n"
-            f"<code>Foydalanuvchilar: {stats.get('users', '?')}</code>\n"
-            f"<code>Faol qarzlar:     {stats.get('debts_active', '?')}</code>\n"
-            f"<code>Hajmi:            {size_kb:.0f} KB</code>"
-        )
-        run_sync(bot.send_document(ADMIN_ID, FSInputFile(tmp), caption=caption), timeout=90)
+        size_kb = run_sync(ops.send_backup(bot), timeout=90)
         return jsonify({"status": "ok", "size_kb": round(size_kb)}), 200
     except Exception as e:  # noqa: BLE001
         logger.error("Backup failed: %s", e, exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":

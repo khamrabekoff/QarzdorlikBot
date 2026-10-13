@@ -7,19 +7,21 @@ invitation that arrives with a reason to accept it.
 
 Editing stays one-sided on purpose: only the owner can change or close a debt.
 Two people editing the same row would need conflict rules nobody wants to
-think about, and the counterparty already gets the value (visibility and
-reminders) without write access.
+think about, and the counterparty already gets the value (visibility,
+reminders, and a notice whenever the owner changes something) without write
+access.
 """
 import logging
 
 from aiogram import Bot, F, Router, types
 from aiogram.filters import CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
 
 import database as db
 import keyboards as kb
-import views
-from handlers.start import show_home
-from utils import fmt_amount, fmt_date, i18n
+from handlers.common import edit_or_send
+from handlers.start import default_lang, show_home
+from utils import display_name, esc, fmt_amount, fmt_date, i18n
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -34,8 +36,11 @@ async def _bot_username(bot: Bot):
 
 @router.callback_query(F.data.startswith("share:"))
 async def share_debt(callback: types.CallbackQuery, bot: Bot):
-    debt_id = int(callback.data.split(":", 1)[1])
     lang = await db.get_user_lang(callback.from_user.id)
+    try:
+        debt_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        debt_id = 0
     debt = await db.get_debt(debt_id)
     if not debt or debt["user_id"] != callback.from_user.id:
         await callback.answer(i18n.get("err_not_found", lang), show_alert=True)
@@ -48,15 +53,16 @@ async def share_debt(callback: types.CallbackQuery, bot: Bot):
 
     link = f"https://t.me/{await _bot_username(bot)}?start=d_{token}"
     await callback.answer()
-    await callback.message.answer(
-        i18n.get("share_ready", lang, name=debt["person_name"])
+    await bot.send_message(
+        callback.from_user.id, i18n.get("share_ready", lang, name=esc(debt["person_name"]))
     )
     # Sent as its own plain message so it can be forwarded or copied whole.
-    await callback.message.answer(
+    await bot.send_message(
+        callback.from_user.id,
         i18n.get(
             "share_text", lang,
             amount=fmt_amount(debt["amount"]),
-            currency=debt["currency"],
+            currency=esc(debt["currency"]),
             date=fmt_date(debt["due_date"]) or i18n.get("no_deadline", lang),
             link=link,
         ),
@@ -67,14 +73,22 @@ async def share_debt(callback: types.CallbackQuery, bot: Bot):
 # ---------- counterparty side: confirm or decline ----------
 
 @router.message(CommandStart(deep_link=True))
-async def deep_link_start(message: types.Message, command: CommandObject, bot: Bot):
+async def deep_link_start(message: types.Message, command: CommandObject, bot: Bot,
+                          state: FSMContext):
     """Handles both `d_<token>` (a shared debt) and `ref_<id>` (an invite)."""
+    await state.clear()
     payload = (command.args or "").strip()
     user = await db.get_user(message.from_user.id)
     is_new = not (user and user["language"])
-    lang = (user["language"] if user and user["language"] else "uz")
+    # Someone arriving through a shared debt skips the language question (the
+    # confirmation is what they came for), so guess from their Telegram app
+    # instead of assuming Uzbek - and remember the guess.
+    lang = default_lang(message.from_user) if is_new else user["language"]
 
-    await db.upsert_user(message.from_user.id, username=message.from_user.username)
+    await db.upsert_user(
+        message.from_user.id, username=message.from_user.username,
+        language=lang if (is_new and payload.startswith("d_")) else None,
+    )
 
     if payload.startswith("ref_"):
         try:
@@ -97,7 +111,7 @@ async def deep_link_start(message: types.Message, command: CommandObject, bot: B
     token = payload[2:]
     debt = await db.get_debt_by_token(token)
     if not debt:
-        await message.answer(i18n.get("share_err_gone", lang))
+        await message.answer(i18n.get("share_err_gone", lang), reply_markup=kb.main_kb(lang))
         return
     if debt["user_id"] == message.from_user.id:
         await message.answer(i18n.get("share_err_own", lang))
@@ -106,7 +120,7 @@ async def deep_link_start(message: types.Message, command: CommandObject, bot: B
     await db.record_referral(message.from_user.id, debt["user_id"], "debt_share")
 
     owner = await db.get_user(debt["user_id"])
-    owner_name = (owner["username"] and "@" + owner["username"]) or debt["person_name"]
+    owner_name = display_name(owner and owner["username"], owner and owner["first_name"])
     # The owner wrote it from their side, so the direction flips for the reader.
     direction = i18n.get(
         "you_owe_them" if debt["debt_type"] == "lent" else "they_owe_you", lang
@@ -116,10 +130,10 @@ async def deep_link_start(message: types.Message, command: CommandObject, bot: B
         i18n.get("confirm_share_title", lang) + "\n\n" +
         i18n.get(
             "confirm_share_body", lang,
-            owner=owner_name,
+            owner=esc(owner_name),
             direction_text=direction,
             amount=fmt_amount(debt["amount"]),
-            currency=debt["currency"],
+            currency=esc(debt["currency"]),
             date=fmt_date(debt["due_date"]) or i18n.get("no_deadline", lang),
         ),
         reply_markup=kb.share_confirm_kb(token, lang),
@@ -142,16 +156,15 @@ async def accept_share(callback: types.CallbackQuery, bot: Bot):
 
     debt = result
     await callback.answer()
-    await callback.message.edit_text(i18n.get("share_ok", lang))
+    await edit_or_send(callback, i18n.get("share_ok", lang))
 
-    who = callback.from_user.username and "@" + callback.from_user.username \
-        or (callback.from_user.first_name or "?")
+    who = display_name(callback.from_user.username, callback.from_user.first_name)
     owner_lang = await db.get_user_lang(debt["user_id"])
     try:
         await bot.send_message(
             debt["user_id"],
-            i18n.get("notify_accepted", owner_lang, name=who,
-                     amount=fmt_amount(debt["amount"]), currency=debt["currency"]),
+            i18n.get("notify_accepted", owner_lang, name=esc(who),
+                     amount=fmt_amount(debt["amount"]), currency=esc(debt["currency"])),
         )
     except Exception as e:  # noqa: BLE001 - owner may have blocked the bot
         logger.info("Could not notify owner %s: %s", debt["user_id"], e)
@@ -164,19 +177,21 @@ async def decline_share(callback: types.CallbackQuery, bot: Bot):
     token = callback.data.split(":", 1)[1]
     lang = await db.get_user_lang(callback.from_user.id)
     debt = await db.get_debt_by_token(token)
-    await db.decline_share(token)
+    if not await db.decline_share(token, callback.from_user.id):
+        # Already confirmed, already declined, or the author's own link.
+        await callback.answer(i18n.get("share_err_taken", lang), show_alert=True)
+        return
     await callback.answer()
-    await callback.message.edit_text(i18n.get("share_no", lang))
+    await edit_or_send(callback, i18n.get("share_no", lang))
 
     if debt:
-        who = callback.from_user.username and "@" + callback.from_user.username \
-            or (callback.from_user.first_name or "?")
+        who = display_name(callback.from_user.username, callback.from_user.first_name)
         owner_lang = await db.get_user_lang(debt["user_id"])
         try:
             await bot.send_message(
                 debt["user_id"],
-                i18n.get("notify_declined", owner_lang, name=who,
-                         amount=fmt_amount(debt["amount"]), currency=debt["currency"]),
+                i18n.get("notify_declined", owner_lang, name=esc(who),
+                         amount=fmt_amount(debt["amount"]), currency=esc(debt["currency"])),
             )
         except Exception as e:  # noqa: BLE001
             logger.info("Could not notify owner %s: %s", debt["user_id"], e)
@@ -190,7 +205,5 @@ async def show_invite(callback: types.CallbackQuery, bot: Bot):
     link = f"https://t.me/{await _bot_username(bot)}?start=ref_{callback.from_user.id}"
     count = await db.count_referrals(callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text(
-        i18n.get("invite_text", lang, link=link, count=count),
-        disable_web_page_preview=True,
-    )
+    await edit_or_send(callback, i18n.get("invite_text", lang, link=link, count=count),
+                       kb.back_to_settings_kb(lang))

@@ -62,11 +62,20 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN referred_by INTEGER",
             "ALTER TABLE users ADD COLUMN source TEXT",
             "ALTER TABLE users ADD COLUMN last_active TIMESTAMP",
+            # v2.1: show the other party a real name instead of "?", remember
+            # a preferred currency, and know when a debt was settled.
+            "ALTER TABLE users ADD COLUMN first_name TEXT",
+            "ALTER TABLE users ADD COLUMN currency TEXT",
+            "ALTER TABLE debts ADD COLUMN closed_at TIMESTAMP",
         ):
             try:
                 await db.execute(stmt)
             except Exception:
                 pass  # column already there
+
+        # Small key/value store for the bot's own bookkeeping: when the cron
+        # last ran, when the last backup went out, alert throttling.
+        await db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 
         # Without these, every list and every reminder sweep is a full scan.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_debts_user_status ON debts(user_id, status)")
@@ -138,6 +147,30 @@ async def get_user_lang(user_id: int) -> str:
     return user["language"] if user and user["language"] else "uz"
 
 
+async def set_user_currency(user_id: int, currency: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET currency = ? WHERE id = ?", (currency, user_id))
+        await db.commit()
+
+
+async def get_default_currency(user_id: int, fallback: str) -> str:
+    """The user's chosen currency, else the one on their newest debt.
+
+    The old helper took the currency of the debt with the *earliest due
+    date*, which is not 'the last one used' at all."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT currency FROM users WHERE id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if row and row["currency"]:
+            return row["currency"]
+        async with db.execute(
+            "SELECT currency FROM debts WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return row["currency"] if row and row["currency"] else fallback
+
+
 async def get_all_user_ids() -> List[int]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
@@ -168,13 +201,31 @@ _VIEW_SELECT = """
                 WHEN d.debt_type = 'lent' THEN 'borrowed'
                 ELSE 'lent' END                        AS view_type,
            CASE WHEN d.user_id = :uid THEN 1 ELSE 0 END AS is_mine,
-           u.username                                   AS owner_username
+           u.username                                   AS owner_username,
+           u.first_name                                 AS owner_first_name
     FROM debts d
     LEFT JOIN users u ON u.id = d.user_id
     WHERE d.status = 'active'
       AND (d.user_id = :uid
            OR (d.counterparty_id = :uid AND d.share_status = 'accepted'))
 """
+
+
+async def search_debts(user_id: int, query: str):
+    """Active debts whose name contains `query`, case-insensitively.
+
+    Filtered in Python on purpose: SQLite's LOWER()/LIKE only fold ASCII, so
+    'али' would never match 'Али'. One user's active debts is a short list."""
+    q = query.casefold().strip()
+    if not q:
+        return []
+    out = []
+    for d in await get_active_debts(user_id):
+        shown = d["person_name"] if d["is_mine"] else (
+            (d["owner_username"] or "") + " " + (d["owner_first_name"] or ""))
+        if q in (shown or "").casefold():
+            out.append(d)
+    return out
 
 
 async def get_active_debts(user_id: int, debt_type: Optional[str] = None):
@@ -195,9 +246,32 @@ async def get_closed_debts(user_id: int, limit: int = 20):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM debts WHERE user_id = ? AND status = 'paid' ORDER BY id DESC LIMIT ?",
+            """SELECT * FROM debts WHERE user_id = ? AND status = 'paid'
+               ORDER BY COALESCE(closed_at, created_at) DESC, id DESC LIMIT ?""",
             (user_id, limit),
         ) as cur:
+            return await cur.fetchall()
+
+
+async def get_debts_for_export(user_id: int):
+    """Everything the user can see - own debts and confirmed shared ones,
+    open and closed - with the direction flipped for the shared ones."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT d.*,
+                   CASE WHEN d.user_id = :uid THEN d.debt_type
+                        WHEN d.debt_type = 'lent' THEN 'borrowed'
+                        ELSE 'lent' END                        AS view_type,
+                   CASE WHEN d.user_id = :uid THEN 1 ELSE 0 END AS is_mine,
+                   u.username   AS owner_username,
+                   u.first_name AS owner_first_name
+            FROM debts d
+            LEFT JOIN users u ON u.id = d.user_id
+            WHERE d.user_id = :uid
+               OR (d.counterparty_id = :uid AND d.share_status = 'accepted')
+            ORDER BY d.status = 'paid', d.due_date IS NULL, d.due_date, d.id
+        """, {"uid": user_id}) as cur:
             return await cur.fetchall()
 
 
@@ -235,9 +309,40 @@ async def get_debts_needing_reminder(today_iso: str, horizon_iso: str = None):
 async def mark_debt_paid(debt_id: int, user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "UPDATE debts SET status = 'paid', paid_amount = amount WHERE id = ? AND user_id = ?",
+            """UPDATE debts SET status = 'paid', paid_amount = amount, closed_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ? AND status = 'active'""",
             (debt_id, user_id),
         )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def reopen_debt(debt_id: int, user_id: int, paid_amount: float) -> bool:
+    """Undo for 'close': back to active with the partial payments it had."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            """UPDATE debts SET status = 'active', closed_at = NULL,
+                                paid_amount = MIN(MAX(?, 0), amount)
+               WHERE id = ? AND user_id = ? AND status = 'paid'""",
+            (paid_amount, debt_id, user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# Whitelist: the column name goes into SQL text, so it must never come from input.
+_EDITABLE = {"person_name", "amount", "due_date", "description"}
+
+
+async def update_debt_field(debt_id: int, user_id: int, field: str, value) -> bool:
+    if field not in _EDITABLE:
+        raise ValueError(f"not editable: {field}")
+    async with aiosqlite.connect(DB_NAME) as db:
+        sql = f"UPDATE debts SET {field} = ? WHERE id = ? AND user_id = ? AND status = 'active'"
+        if field == "due_date":
+            # A new deadline deserves fresh reminders, not 'already reminded today'.
+            sql = sql.replace("SET due_date = ?", "SET due_date = ?, last_reminded_at = NULL")
+        cur = await db.execute(sql, (value, debt_id, user_id))
         await db.commit()
         return cur.rowcount > 0
 
@@ -261,7 +366,10 @@ async def update_debt_payment(debt_id: int, user_id: int, payment_amount: float)
             new_paid, status = total, "paid"
 
         await db.execute(
-            "UPDATE debts SET paid_amount = ?, status = ? WHERE id = ?", (new_paid, status, debt_id)
+            """UPDATE debts SET paid_amount = ?, status = ?,
+                                closed_at = CASE WHEN ? = 'paid' THEN CURRENT_TIMESTAMP END
+               WHERE id = ?""",
+            (new_paid, status, status, debt_id),
         )
         await db.commit()
         return True, round(total - new_paid, 2)
@@ -278,8 +386,8 @@ async def get_recent_names(user_id: int, limit: int = 6) -> List[str]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT person_name, MAX(created_at) AS last_used
-            FROM debts WHERE user_id = ?
+            SELECT person_name, MAX(id) AS last_used
+            FROM debts WHERE user_id = ? AND person_name IS NOT NULL AND person_name != ''
             GROUP BY person_name
             ORDER BY last_used DESC
             LIMIT ?
@@ -381,12 +489,19 @@ async def accept_share(token: str, counterparty_id: int):
     return True, debt
 
 
-async def decline_share(token: str):
+async def decline_share(token: str, user_id: int) -> bool:
+    """Only a pending invite can be declined, and not by its own author.
+
+    Previously anyone holding the link could flip an already-confirmed debt
+    to 'declined' - including a stranger it was forwarded to."""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE debts SET share_status = 'declined' WHERE share_token = ?", (token,)
+        cur = await db.execute(
+            """UPDATE debts SET share_status = 'declined'
+               WHERE share_token = ? AND share_status = 'pending' AND user_id != ?""",
+            (token, user_id),
         )
         await db.commit()
+        return cur.rowcount > 0
 
 
 # ---------- growth ----------
@@ -405,10 +520,17 @@ async def record_referral(user_id: int, referrer_id: Optional[int], source: str)
         await db.commit()
 
 
-async def touch_user(user_id: int):
+async def touch_user(user_id: int, username: Optional[str] = None,
+                     first_name: Optional[str] = None):
+    """Stamp activity and keep the display name fresh - people change their
+    @username, and the other side of a shared debt should see the current one."""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE id = ?", (user_id,)
+            """UPDATE users SET last_active = CURRENT_TIMESTAMP,
+                                username   = COALESCE(?, username),
+                                first_name = COALESCE(?, first_name)
+               WHERE id = ?""",
+            (username, first_name, user_id),
         )
         await db.commit()
 
@@ -427,6 +549,11 @@ async def get_growth_stats():
         "users_total": "SELECT COUNT(*) FROM users",
         "users_week": "SELECT COUNT(*) FROM users WHERE joined_at >= DATE('now', '-7 days')",
         "active_week": "SELECT COUNT(*) FROM users WHERE last_active >= DATE('now', '-7 days')",
+        "active_month": "SELECT COUNT(*) FROM users WHERE last_active >= DATE('now', '-30 days')",
+        # Came back: active this week, but joined more than a week ago.
+        "returning_week": """SELECT COUNT(*) FROM users
+                             WHERE last_active >= DATE('now', '-7 days')
+                               AND joined_at < DATE('now', '-7 days')""",
         "from_referral": "SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL",
         "debts_week": "SELECT COUNT(*) FROM debts WHERE created_at >= DATE('now', '-7 days')",
         "shares_sent": "SELECT COUNT(*) FROM debts WHERE share_token IS NOT NULL",
@@ -442,3 +569,22 @@ async def get_growth_stats():
                 logger.warning("growth stat %s failed: %s", name, e)
                 out[name] = None
     return out
+
+
+# ---------- meta ----------
+
+async def meta_get(key: str, default: Optional[str] = None) -> Optional[str]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM meta WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else default
+
+
+async def meta_set(key: str, value: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )
+        await db.commit()

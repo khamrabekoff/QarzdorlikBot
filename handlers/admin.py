@@ -1,12 +1,13 @@
-"""Admin-only commands: stats and broadcast."""
+"""Admin-only commands: stats, backup, broadcast."""
 import asyncio
 import logging
 
-from aiogram import Bot, F, Router, types
+from aiogram import Bot, Router, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
 import database as db
+import ops
 from config import ADMIN_ID
 from states import Admin
 
@@ -33,9 +34,11 @@ async def cmd_stats(message: types.Message):
         f"<code>Foydalanuvchilar: {stats['users']}</code>\n"
         f"<code>Faol qarzlar:     {stats['debts_active']}</code>\n"
         f"<code>Yopilgan:         {stats['debts_paid']}</code>\n\n"
-        "📈 <b>O'sish (7 kun)</b>\n" + "━" * 18 + "\n"
-        f"<code>Yangi:            {g['users_week']}</code>\n"
-        f"<code>Faol:             {g['active_week']} ({pct(g['active_week'], g['users_total'])})</code>\n"
+        "📈 <b>O'sish</b>\n" + "━" * 18 + "\n"
+        f"<code>Yangi (7 kun):    {g['users_week']}</code>\n"
+        f"<code>Faol (7 kun):     {g['active_week']} ({pct(g['active_week'], g['users_total'])})</code>\n"
+        f"<code>Faol (30 kun):    {g['active_month']} ({pct(g['active_month'], g['users_total'])})</code>\n"
+        f"<code>Qaytganlar:       {g['returning_week']}</code>\n"
         f"<code>Yangi qarzlar:    {g['debts_week']}</code>\n\n"
         "🤝 <b>Ulashish</b>\n" + "━" * 18 + "\n"
         f"<code>Yuborilgan:       {g['shares_sent']}</code>\n"
@@ -44,18 +47,22 @@ async def cmd_stats(message: types.Message):
     )
 
 
+@router.message(Command("backup"))
+async def cmd_backup(message: types.Message, bot: Bot):
+    if not _is_admin(message.from_user.id):
+        return
+    try:
+        await ops.send_backup(bot)
+    except Exception as e:  # noqa: BLE001
+        await message.answer(f"❌ {e}")
+
+
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         return
     await state.set_state(Admin.broadcast)
     await message.answer("Yuboriladigan xabarni yozing.\nBekor qilish: /cancel")
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Bekor qilindi.")
 
 
 @router.message(Admin.broadcast)

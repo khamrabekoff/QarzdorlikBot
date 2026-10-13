@@ -12,10 +12,18 @@ class AddDebt(StatesGroup):
     entering_who_amount = State()
     entering_amount = State()
     entering_date = State()
+    entering_note = State()
+    # Typed "Ali 500000" from the home screen; waiting for which way round.
+    choosing_type = State()
 
 
 class Pay(StatesGroup):
     entering_amount = State()
+
+
+class Edit(StatesGroup):
+    # One state for every field; which field is kept in the FSM data.
+    value = State()
 
 
 class Admin(StatesGroup):

@@ -13,13 +13,19 @@ about an overdue debt *every single day, forever*, which is exactly how a bot
 gets muted - and a muted bot is a lost user. Backing off keeps the reminder
 meaningful.
 
+A confirmed shared debt is reminded to BOTH sides. The share invitation
+promised exactly that ("eslatma ikkalangizga ham keladi"), but until v2.1
+only the owner was ever messaged.
+
 Debts with no due date are never reminded about; they are excluded in SQL.
 """
 import logging
 from datetime import datetime, timedelta
 
 import database as db
-from utils import fmt_amount, fmt_date, i18n, now_local
+import keyboards as kb
+import views
+from utils import display_name, now_local, utc_to_local
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +49,8 @@ def _reminder_kind(debt, now):
         return "before" if delta == PRE_REMIND_DAYS and now.hour >= REMIND_HOUR else None
 
     if delta == 0:
-        created = debt["created_at"]
-        try:
-            created_dt = datetime.strptime(str(created), "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            created_dt = None
+        # created_at is UTC (SQLite CURRENT_TIMESTAMP); `now` is local.
+        created_dt = utc_to_local(debt["created_at"])
         if created_dt and created_dt.date() == now.date():
             # Added and due the same day - give them half an hour before nagging.
             return "today" if now >= created_dt + CREATED_TODAY_DELAY else None
@@ -59,6 +62,14 @@ def _reminder_kind(debt, now):
     if days_over in OVERDUE_STEPS or (days_over > 30 and days_over % 30 == 0):
         return "overdue"
     return None
+
+
+def _recipients(debt):
+    """(user_id, is_owner) for everyone who should hear about this debt."""
+    out = [(debt["user_id"], True)]
+    if debt["counterparty_id"] and debt["share_status"] == "accepted":
+        out.append((debt["counterparty_id"], False))
+    return out
 
 
 async def sweep_reminders(bot, dry_run: bool = False):
@@ -78,6 +89,7 @@ async def sweep_reminders(bot, dry_run: bool = False):
             {
                 "debt_id": d["id"],
                 "user_id": d["user_id"],
+                "also_to": d["counterparty_id"] if d["share_status"] == "accepted" else None,
                 "person": d["person_name"],
                 "due": d["due_date"],
                 "kind": kind,
@@ -85,37 +97,39 @@ async def sweep_reminders(bot, dry_run: bool = False):
             for d, kind in due_now
         ]
 
-    lang_cache = {}
+    users = {}
+
+    async def user(uid):
+        if uid not in users:
+            users[uid] = await db.get_user(uid)
+        return users[uid]
+
     sent = 0
     for debt, kind in due_now:
-        user_id = debt["user_id"]
-        if user_id not in lang_cache:
-            lang_cache[user_id] = await db.get_user_lang(user_id)
-        lang = lang_cache[user_id]
-
-        remaining = (debt["amount"] or 0) - (debt["paid_amount"] or 0)
-        direction = i18n.get(
-            "dir_lent" if debt["debt_type"] == "lent" else "dir_borrowed", lang
-        )
         days_over = (now.date() - datetime.strptime(debt["due_date"], "%Y-%m-%d").date()).days
+        days = PRE_REMIND_DAYS if kind == "before" else days_over
+        owner = await user(debt["user_id"])
+        owner_display = display_name(owner and owner["username"], owner and owner["first_name"])
 
-        text = i18n.get(
-            {"before": "reminder_before", "today": "reminder_today"}.get(kind, "reminder_overdue"),
-            lang,
-            direction=direction,
-            name=debt["person_name"],
-            amount=fmt_amount(remaining),
-            currency=debt["currency"],
-            date=fmt_date(debt["due_date"]),
-            days=PRE_REMIND_DAYS if kind == "before" else days_over,
-        )
+        delivered = False
+        for uid, is_owner in _recipients(debt):
+            u = await user(uid)
+            lang = (u and u["language"]) or "uz"
+            view_type = debt["debt_type"] if is_owner else (
+                "borrowed" if debt["debt_type"] == "lent" else "lent")
+            try:
+                await bot.send_message(
+                    uid,
+                    views.reminder_text(debt, kind, lang, days, is_owner, owner_display),
+                    reply_markup=kb.reminder_kb(debt["id"], view_type, lang, is_owner=is_owner),
+                )
+                sent += 1
+                delivered = True
+            except Exception as e:  # noqa: BLE001 - one bad chat must not stop the sweep
+                logger.warning("Reminder to %s failed: %s", uid, e)
 
-        try:
-            await bot.send_message(user_id, text)
+        if delivered:
             await db.update_last_reminded(debt["id"], now.strftime("%Y-%m-%d %H:%M:%S"))
-            sent += 1
-        except Exception as e:  # noqa: BLE001 - one bad chat must not stop the sweep
-            logger.warning("Reminder to %s failed: %s", user_id, e)
 
     if sent:
         logger.info("Reminder sweep sent %d messages", sent)
