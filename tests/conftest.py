@@ -12,9 +12,7 @@ from html.parser import HTMLParser
 
 # Configuration is read at import time, so the environment comes first.
 _DB = os.path.join(tempfile.mkdtemp(prefix="qarz_test_"), "test.db")
-os.environ.update(BOT_TOKEN="123456:TEST-TOKEN", DB_PATH=_DB, ADMIN_ID="999",
-                  CRON_SECRET="cron-secret", DEPLOY_SECRET="deploy-secret")
-os.environ.pop("PA_API_TOKEN", None)
+os.environ.update(BOT_TOKEN="123456:TEST-TOKEN", DB_PATH=_DB, ADMIN_ID="999")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aiosqlite  # noqa: E402
@@ -24,7 +22,12 @@ from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User  # noqa: E402
 
-import app as bot_app  # noqa: E402  (creates the schema in _DB)
+import asyncio  # noqa: E402
+
+import bot as bot_app  # noqa: E402
+import database  # noqa: E402
+
+asyncio.run(database.init_db())  # create the schema in _DB
 
 ALLOWED_TAGS = {"b", "i", "u", "s", "code", "pre", "a", "tg-spoiler", "blockquote"}
 

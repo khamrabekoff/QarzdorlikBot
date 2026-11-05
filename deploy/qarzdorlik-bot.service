@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram-бот Qarzdorlik (polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bots/qarzdorlik
+ExecStart=/home/ubuntu/bots/qarzdorlik/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+MemoryMax=250M
+
+[Install]
+WantedBy=multi-user.target

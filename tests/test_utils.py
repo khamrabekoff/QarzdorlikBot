@@ -105,7 +105,7 @@ def test_debt_card_escapes_user_input():
 
 
 def test_cards_stay_small():
-    """Every card goes through PythonAnywhere's slow proxy; size is speed."""
+    """Cards are sent often; size is speed."""
     import cards
     debts = [{"id": i, "user_id": 1, "debt_type": "lent", "view_type": "lent", "is_mine": 1,
               "amount": 1000 * i, "paid_amount": 0, "currency": "so'm", "person_name": f"Odam {i}",

@@ -1,7 +1,7 @@
 """SQLite-backed FSM storage for aiogram.
 
 aiogram's default MemoryStorage keeps conversation state in RAM. On
-PythonAnywhere the web worker is recycled constantly, so a user halfway
+a restarted process loses RAM, so a user halfway
 through adding a debt (5 steps) would silently lose their progress and the
 bot would stop making sense to them - the single worst thing that can happen
 to a public bot's retention. Persisting state to the same SQLite file the
