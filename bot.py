@@ -18,9 +18,12 @@ async def scheduler():
             sent = await asyncio.wait_for(sweep_reminders(bot), 120)
             if sent:
                 logger.info("Reminder sweep sent %d", sent)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reminder sweep failed: %s", e, exc_info=True)
+        try:
             await asyncio.wait_for(_housekeeping(from_cron=True), 120)
         except Exception as e:  # noqa: BLE001
-            logger.warning("Scheduled tick failed: %s", e, exc_info=True)
+            logger.warning("Housekeeping failed: %s", e, exc_info=True)
         await asyncio.sleep(TICK_SECONDS)
 
 
